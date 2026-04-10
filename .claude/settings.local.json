@@ -17,7 +17,8 @@
       "Bash(where ffmpeg:*)",
       "Bash(ls \"f:/Dropbox/NorthBent/MixABTestGPU/\"*.exe)",
       "Bash(.venv/Scripts/python.exe -c ':*)",
-      "Bash(.venv/Scripts/python.exe mixabtestgpu/analyze_perf.py)"
+      "Bash(.venv/Scripts/python.exe mixabtestgpu/analyze_perf.py)",
+      "Bash(.venv/Scripts/python.exe mixabtestgpu/analyze_perf.py --all)"
     ]
   }
 }

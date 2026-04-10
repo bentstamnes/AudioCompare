@@ -3,7 +3,7 @@ renderers/waveform.py — GPU waveform texture renderer for MixABTestGPU.
 
 Each track slot owns one WaveformTexture instance.  Every frame (or on
 resize/seek) the caller passes updated parameters; the renderer writes into
-a numpy RGBA array and uploads it to a Dear PyGui dynamic texture in one
+a numpy RGB array and uploads it to a Dear PyGui dynamic texture in one
 call (set_value).  The texture is then displayed via add_image inside a
 child-window drawlist.
 
@@ -13,6 +13,12 @@ Design:
   - Supports dim (non-active) rendering.
   - Supports an optional vertical playhead line (white, 2 px wide).
   - Texture is (re)allocated only when width or height changes.
+  - Dirty tracking: skips rebuild+upload when nothing visible has changed.
+    Inactive tracks upload once (on load/resize) and never again during playback.
+  - Raw texture (add_raw_texture) instead of dynamic: skips DPG safety checks on
+    every set_value call; designed for large textures updated every frame.
+  - float32 RGB (3 ch, mvFormat_Float_rgb) — 25% smaller per upload vs RGBA.
+    NOTE: mvFormat_Float_rgb is only valid on raw textures, not dynamic textures.
 """
 
 from __future__ import annotations
@@ -20,15 +26,11 @@ import numpy as np
 import dearpygui.dearpygui as dpg
 
 
-# RGBA float32 constant — DPG dynamic textures use 0.0–1.0 floats per channel.
-_TRANSPARENT = np.zeros(4, dtype=np.float32)
-
-
-def _hex_to_rgba_f32(hex_color: str, alpha: float = 1.0) -> np.ndarray:
-    """Convert '#rrggbb' to a float32 RGBA array [R, G, B, A]."""
+def _hex_to_rgb_f32(hex_color: str) -> np.ndarray:
+    """Convert '#rrggbb' to a float32 RGB array [R, G, B]."""
     h = hex_color.lstrip("#")
     r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-    return np.array([r / 255.0, g / 255.0, b / 255.0, alpha], dtype=np.float32)
+    return np.array([r / 255.0, g / 255.0, b / 255.0], dtype=np.float32)
 
 
 class WaveformTexture:
@@ -48,18 +50,23 @@ class WaveformTexture:
         self._width   = max(1, width)
         self._height  = max(1, height)
 
-        self._bg       = _hex_to_rgba_f32(bg_color)
-        self._active   = _hex_to_rgba_f32(active_color)
-        self._inactive = _hex_to_rgba_f32(inactive_color)
-        self._dim      = _hex_to_rgba_f32(dim_color)
+        self._bg       = _hex_to_rgb_f32(bg_color)
+        self._active   = _hex_to_rgb_f32(active_color)
+        self._inactive = _hex_to_rgb_f32(inactive_color)
+        self._dim      = _hex_to_rgb_f32(dim_color)
 
-        # Pre-allocated pixel buffer: (H, W, 4) float32
-        self._buf = np.empty((self._height, self._width, 4), dtype=np.float32)
+        # Pre-allocated pixel buffer: (H, W, 3) float32 — RGB, no alpha channel
+        self._buf = np.empty((self._height, self._width, 3), dtype=np.float32)
 
-        # DPG texture tag
-        flat = np.zeros(self._width * self._height * 4, dtype=np.float32)
-        self._tag = dpg.add_dynamic_texture(
-            self._width, self._height, flat, parent=self._reg
+        # Raw texture: designed for large textures updated every frame.
+        # mvFormat_Float_rgb = 3 floats/pixel (25% smaller than RGBA).
+        # add_raw_texture skips DPG's safety checks/conversion on every set_value call.
+        # NOTE: mvFormat_Float_rgb is only valid on raw textures, not dynamic textures.
+        flat = np.zeros(self._width * self._height * 3, dtype=np.float32)
+        self._tag = dpg.add_raw_texture(
+            self._width, self._height, flat,
+            format=dpg.mvFormat_Float_rgb,
+            parent=self._reg,
         )
 
         # Cached waveform columns: shape (W_wave,) int16 amplitudes in pixels
@@ -86,12 +93,16 @@ class WaveformTexture:
             return
         self._width  = width
         self._height = height
-        self._buf    = np.empty((height, width, 4), dtype=np.float32)
+        self._buf    = np.empty((height, width, 3), dtype=np.float32)
         self._mark   = np.zeros((height + 1, width), dtype=np.int8)
         # Replace DPG texture with a new one of the right size
         old_tag = self._tag
-        flat = np.zeros(width * height * 4, dtype=np.float32)
-        self._tag = dpg.add_dynamic_texture(width, height, flat, parent=self._reg)
+        flat = np.zeros(width * height * 3, dtype=np.float32)
+        self._tag = dpg.add_raw_texture(
+            width, height, flat,
+            format=dpg.mvFormat_Float_rgb,
+            parent=self._reg,
+        )
         dpg.delete_item(old_tag)
         # Force full re-render next frame
         self._dirty = True
@@ -112,9 +123,9 @@ class WaveformTexture:
         h = self._height
 
         if not samples or max_dur <= 0 or track_dur <= 0:
-            self._wave_amps   = None
+            self._wave_amps     = None
             self._wave_px_count = 0
-            self._dirty = True
+            self._dirty         = True
             return
 
         px_count = max(1, int(w * min(1.0, track_dur / max_dur)))
@@ -131,7 +142,6 @@ class WaveformTexture:
         samps_arr = np.asarray(samples, dtype=np.int32)
 
         # For each column, take max(|sample|) in [i0, i1)
-        # Use a simple loop-free approach: reduce by column boundaries
         # Build a running-max via np.maximum.reduceat
         abs_samps = np.abs(samps_arr)
         col_max   = np.maximum.reduceat(abs_samps, i0_arr)[:px_count]
@@ -172,8 +182,8 @@ class WaveformTexture:
         # Fill background
         buf[:] = self._bg
 
-        amps      = self._wave_amps
-        px_count  = self._wave_px_count
+        amps     = self._wave_amps
+        px_count = self._wave_px_count
 
         if amps is not None and px_count > 0:
             mid   = h // 2
@@ -198,7 +208,7 @@ class WaveformTexture:
         # Playhead line (2 px wide, white)
         if show_playhead and play_px >= 0:
             px = max(0, min(w - 1, play_px))
-            buf[:, max(0, px - 1):px + 1, :] = [1.0, 1.0, 1.0, 0.9]
+            buf[:, max(0, px - 1):px + 1, :] = [1.0, 1.0, 1.0]
 
         # Upload: DPG set_value accepts a numpy array directly (much faster than tolist)
         if dpg.does_item_exist(self._tag):
