@@ -551,7 +551,6 @@ class MixABTestGPU:
         for i in range(MAX_TRACKS):
             self._build_slot_window(i, vw, slot_h)
 
-        self._update_dim_rects()
         self._refresh_placeholder()
 
     def _build_slot_window(self, idx: int, vw: int, h: int) -> None:
@@ -629,11 +628,12 @@ class MixABTestGPU:
                            tag=f"slot_bg_{idx}", parent=dl)
         dpg.draw_image(tex.tag, (0, 0), (wave_w, h),
                        tag=f"slot_wave_img_{idx}", parent=dl)
-        # Dark overlay on top of waveform — always drawn, opacity controls visibility.
-        # fill alpha=0 = transparent (inactive), alpha=178 = 70% dark (active+FFT on).
+        # Dark overlay drawn on top of the waveform when FFT is showing on this slot.
+        # Visibility is driven per-slot by _apply_spectrum, not set here.
         dim_rect = dpg.draw_rectangle(
             (0, 0), (wave_w, h),
-            color=(0, 0, 0, 0), fill=(0, 0, 0, 0),
+            color=(0, 0, 0, 0), fill=(0, 0, 0, 178),   # ~70% dark
+            show=False,
             tag=f"slot_dim_{idx}",
             parent=dl,
         )
@@ -690,15 +690,7 @@ class MixABTestGPU:
         if self._font_bold:
             dpg.bind_item_font(name_tag, self._font_bold)
 
-        # 5. Playhead line — drawn AFTER spectrogram so it renders on top of everything.
-        #    Position updated every frame in _update_frame.
-        dpg.draw_line(
-            (0, 0), (0, h),
-            color=(255, 255, 255, 220), thickness=2,
-            tag=f"slot_play_line_{idx}", parent=dl,
-        )
-
-        # 6. "x" drawn in the drawlist top-right — brightens when mouse held in
+        # 5. "x" drawn in the drawlist top-right — brightens when mouse held in
         #    that zone. Removal fires from _on_slot_click hit-zone detection.
         dpg.draw_text((wave_w - 16, 4), "x", size=13,
                       color=(180, 180, 180, 160),
@@ -1290,11 +1282,8 @@ class MixABTestGPU:
             tex.render(
                 is_active=(idx == self._active),
                 play_px=play_px,
-                show_playhead=False,   # playhead drawn as separate draw_line above dim/spectrogram
+                show_playhead=True,
             )
-            line_tag = f"slot_play_line_{idx}"
-            if play_px >= 0 and dpg.does_item_exist(line_tag):
-                dpg.configure_item(line_tag, p1=(play_px, 0), p2=(play_px, slot_h))
 
         # Null slot waveform
         if self._null_mode and self._null_tex and self._null_wave_raw:
@@ -1414,10 +1403,19 @@ class MixABTestGPU:
     def _apply_spectrum(self, spectra: dict, active_id) -> None:
         try:
             n_bands = self._fft_bands
+            fft_on  = self._spectrum_enabled or self._spectrogram_enabled
             for idx, t in enumerate(self._tracks):
                 tid = t["id"]
                 is_active = tid == active_id
                 hide = self._fft_show_active and not is_active
+
+                # Dim overlay: only on slots that are actually showing FFT content
+                dim_tag = self._slot_dim_rects[idx]
+                if dim_tag is not None:
+                    try:
+                        dpg.configure_item(dim_tag, show=(fft_on and not hide))
+                    except Exception:
+                        pass
 
                 ov = self._slot_spectra[idx]
                 if ov:
@@ -1638,10 +1636,9 @@ class MixABTestGPU:
         else:
             self._engine.set_active(t["id"])
 
-        # Update name label colours and dim overlay
+        # Update name label colours
         self._update_name_colors()
         self._update_dots()
-        self._update_dim_rects()
         if self._null_mode:
             self._update_null_status()
 
@@ -1823,21 +1820,16 @@ class MixABTestGPU:
                 bar.set_visible(self._meter_enabled and self._corr_enabled)
 
     def _update_dim_rects(self) -> None:
-        """Dim all slots when spectrogram is active; clear when off.
-        Active track gets full dim (spectrogram renders on top); inactive tracks get
-        a lighter dim so the waveform remains partially visible."""
+        """Sync waveform dim overlay visibility with current FFT and active-slot state.
+        Called directly on any state change — no threading involved."""
+        fft_on = self._spectrum_enabled or self._spectrogram_enabled
         for idx in range(4):
             tag = self._slot_dim_rects[idx]
             if tag is None:
                 continue
-            if not self._spectrogram_enabled:
-                alpha = 0
-            elif idx == self._active:
-                alpha = 178   # ~70% — spectrogram renders on top so waveform can be dark
-            else:
-                alpha = 100   # ~39% — lighter, waveform still readable as context
+            hide = self._fft_show_active and (idx != self._active)
             try:
-                dpg.configure_item(tag, fill=(0, 0, 0, alpha))
+                dpg.configure_item(tag, show=(fft_on and not hide))
             except Exception:
                 pass
 

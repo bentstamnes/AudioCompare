@@ -1,0 +1,134 @@
+"""
+renderers/spectrogram.py — Real-time scrolling spectrogram overlay.
+
+Draws a horizontal spectrogram directly into a parent DPG drawlist using a
+dynamic texture.  Each FFT update shifts the buffer one column left and writes
+the new frequency column on the right edge.
+
+Frequency layout: low freq at bottom (y = height-1), high freq at top (y = 0).
+Brightness encodes amplitude: quiet = transparent, loud = opaque.
+Mutually exclusive with SpectrumOverlay — only one is shown at a time.
+"""
+
+from __future__ import annotations
+import numpy as np
+import dearpygui.dearpygui as dpg
+
+_SPECTRUM_DB_FLOOR = -70.0   # dBFS floor (matches spectrum.py)
+
+
+class SpectrogramStrip:
+    """Scrolling spectrogram overlay drawn into a parent DPG drawlist."""
+
+    def __init__(
+        self,
+        tex_registry: int | str,
+        drawlist_tag: int | str,
+        width: int,
+        height: int,
+        active_color: str,   # hex e.g. "#ff8040"
+    ) -> None:
+        self._dl      = drawlist_tag
+        self._width   = max(1, width)
+        self._height  = max(1, height)
+        self._visible = False   # hidden by default; enabled via set_visible
+
+        # Parse active color
+        h = active_color.lstrip("#")
+        self._r = int(h[0:2], 16) / 255.0
+        self._g = int(h[2:4], 16) / 255.0
+        self._b = int(h[4:6], 16) / 255.0
+
+        # Dim multiplier when track is not the active one
+        self._brightness = 1.0   # 1.0 = active, 0.5 = inactive
+
+        # RGBA float32 pixel buffer: shape (height, width, 4)
+        # Stored row-major; DPG textures are row-major too.
+        self._buf = np.zeros((self._height, self._width, 4), dtype=np.float32)
+
+        # DPG dynamic texture (registered into the app's shared texture_registry)
+        # Use ravel() for the initial value — DPG accepts numpy arrays directly.
+        self._tex = dpg.add_dynamic_texture(
+            self._width, self._height, self._buf.ravel(), parent=tex_registry,
+        )
+
+        # Draw image into the drawlist (covers the full waveform area)
+        self._img = dpg.draw_image(
+            self._tex,
+            pmin=(0, 0),
+            pmax=(self._width, self._height),
+            show=self._visible,
+            parent=self._dl,
+        )
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def update(self, raw_bands: np.ndarray | None, n_bands: int) -> None:
+        """Scroll buffer left by one pixel and paint new column from raw_bands."""
+        if not self._visible:
+            return
+
+        w = self._width
+        h = self._height
+        br = self._brightness
+
+        # Scroll: shift all columns left by 1
+        if w > 1:
+            self._buf[:, :w - 1, :] = self._buf[:, 1:, :]
+
+        # Build the new rightmost column (shape: h × 4)
+        col = np.zeros((h, 4), dtype=np.float32)
+
+        if raw_bands is not None and len(raw_bands) > 0:
+            nb = len(raw_bands)
+            # Convert dB bands to 0..1 fractions
+            fracs = np.clip(
+                (raw_bands - _SPECTRUM_DB_FLOOR) / (-_SPECTRUM_DB_FLOOR),
+                0.0, 1.0,
+            ).astype(np.float32)
+
+            # Map bands to pixel rows: band 0 → bottom row (h-1), band nb-1 → top row (0)
+            # Each band covers h/nb rows; use nearest-neighbour mapping.
+            row_indices = np.arange(h, dtype=np.float32)
+            # Which band does each row belong to?
+            band_for_row = ((h - 1 - row_indices) / h * nb).astype(np.int32)
+            band_for_row = np.clip(band_for_row, 0, nb - 1)
+            amp = fracs[band_for_row]   # shape: (h,)
+
+            col[:, 0] = self._r * br
+            col[:, 1] = self._g * br
+            col[:, 2] = self._b * br
+            col[:, 3] = amp * br        # alpha encodes amplitude
+
+        self._buf[:, w - 1, :] = col
+
+        # Push to GPU — ravel() gives a contiguous view (no copy if already C-contiguous)
+        dpg.set_value(self._tex, self._buf.ravel())
+
+    def set_visible(self, visible: bool) -> None:
+        self._visible = visible
+        try:
+            dpg.configure_item(self._img, show=visible)
+        except Exception:
+            pass
+        if not visible:
+            # Clear buffer so it starts fresh next time it becomes visible
+            self._buf[:] = 0.0
+            try:
+                dpg.set_value(self._tex, self._buf.ravel())
+            except Exception:
+                pass
+
+    def set_active(self, is_active: bool) -> None:
+        self._brightness = 1.0 if is_active else 0.5
+
+    def delete(self) -> None:
+        try:
+            dpg.delete_item(self._img)
+        except Exception:
+            pass
+        try:
+            dpg.delete_item(self._tex)
+        except Exception:
+            pass
+        self._buf = np.zeros((1, 1, 4), dtype=np.float32)

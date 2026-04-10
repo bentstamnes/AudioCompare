@@ -1823,19 +1823,13 @@ class MixABTestGPU:
                 bar.set_visible(self._meter_enabled and self._corr_enabled)
 
     def _update_dim_rects(self) -> None:
-        """Dim all slots when spectrogram is active; clear when off.
-        Active track gets full dim (spectrogram renders on top); inactive tracks get
-        a lighter dim so the waveform remains partially visible."""
+        """Dim the active slot's waveform in spectrogram mode only; all others transparent."""
+        fft_on = self._spectrogram_enabled
         for idx in range(4):
             tag = self._slot_dim_rects[idx]
             if tag is None:
                 continue
-            if not self._spectrogram_enabled:
-                alpha = 0
-            elif idx == self._active:
-                alpha = 178   # ~70% — spectrogram renders on top so waveform can be dark
-            else:
-                alpha = 100   # ~39% — lighter, waveform still readable as context
+            alpha = 178 if (fft_on and idx == self._active) else 0
             try:
                 dpg.configure_item(tag, fill=(0, 0, 0, alpha))
             except Exception:
