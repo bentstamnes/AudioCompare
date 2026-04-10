@@ -67,7 +67,7 @@ class MeterStrip:
         h   = self._height
 
         # Background
-        dpg.draw_rectangle(
+        self._bg_rect = dpg.draw_rectangle(
             (x0, 0), (x1, h),
             color=(0, 0, 0, 0), fill=self._clr_bg,
             parent=self._dl,
@@ -148,3 +148,11 @@ class MeterStrip:
             dpg.configure_item(self._rms_txt, text=f"{rms_db:+.1f}")
         else:
             dpg.configure_item(self._rms_txt, text="")
+
+    def set_visible(self, visible: bool) -> None:
+        for item in (self._bg_rect, self._rms_rect, self._peak_line,
+                     self._peak_txt, self._rms_txt):
+            try:
+                dpg.configure_item(item, show=visible)
+            except Exception:
+                pass

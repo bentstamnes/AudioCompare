@@ -567,7 +567,7 @@ class MixABTestGPU:
         track  = self._tracks[idx]
         colors = _TRACK_COLORS[track["slot"]]
         bg     = _hex_to_dpg_rgba(colors[0])
-        wave_w = max(1, vw - (METER_W if self._meter_enabled else 0))
+        wave_w = max(1, vw - METER_W)
 
         # Waveform texture
         tex = WaveformTexture(
@@ -616,18 +616,21 @@ class MixABTestGPU:
                            tag=f"slot_bg_{idx}", parent=dl)
         dpg.draw_image(tex.tag, (0, 0), (wave_w, h),
                        tag=f"slot_wave_img_{idx}", parent=dl)
-        if self._meter_enabled:
-            meter_h = h - (CORR_TOTAL if self._corr_enabled else 0)
-            strip = MeterStrip(
-                dl,
-                x_offset=wave_w,
-                active_color=colors[1],
-                inactive_color=colors[2],
-                height=meter_h,
-            )
-            self._slot_meters[idx] = strip
-            if self._corr_enabled:
-                self._slot_corr[idx] = CorrelationBar(dl, x_offset=wave_w, slot_height=h)
+        # Always create meter and corr bar; show/hide via set_visible so
+        # toggling them never requires a full slot rebuild (avoids GIL stalls
+        # that cause audio dropouts).
+        strip = MeterStrip(
+            dl,
+            x_offset=wave_w,
+            active_color=colors[1],
+            inactive_color=colors[2],
+            height=h,
+        )
+        strip.set_visible(self._meter_enabled)
+        self._slot_meters[idx] = strip
+        corr_bar = CorrelationBar(dl, x_offset=wave_w, slot_height=h)
+        corr_bar.set_visible(self._meter_enabled and self._corr_enabled)
+        self._slot_corr[idx] = corr_bar
 
         # 3. Spectrum bars — drawn directly into slot_dl at x_offset=0, same
         #    pattern as MeterStrip.  No separate drawlist; eliminates all pos=
@@ -1032,7 +1035,7 @@ class MixABTestGPU:
         if not dpg.does_item_exist(dl_tag) or curve is None:
             return
 
-        meter_w  = METER_W if self._meter_enabled else 0
+        meter_w  = METER_W
         slot_tag = f"slot_win_{idx}"
         slot_w   = slot_h = 0
         if dpg.does_item_exist(slot_tag):
@@ -1233,7 +1236,7 @@ class MixABTestGPU:
             else:
                 slot_w = self._track_area_w
                 slot_h = max(1, (self._track_area_h - _TRACK_PAD * (MAX_TRACKS - 1)) // MAX_TRACKS)
-            wave_w = slot_w - (METER_W if self._meter_enabled else 0)
+            wave_w = slot_w - METER_W
             play_px = int(wave_w * frac) if max_dur > 0 else -1
             tex.render(
                 is_active=(idx == self._active),
@@ -1348,8 +1351,13 @@ class MixABTestGPU:
         ).start()
 
     def _spectrum_thread(self, track_ids, active_id) -> None:
-        spectra = self._engine.sample_spectrum(track_ids)
-        self._post(self._apply_spectrum, spectra, active_id)
+        try:
+            spectra = self._engine.sample_spectrum(track_ids)
+            self._post(self._apply_spectrum, spectra, active_id)
+        except Exception:
+            import traceback
+            self._post(_log, f"_spectrum_thread EXCEPTION: {traceback.format_exc()}")
+            self._spectrum_pending = False
 
     def _apply_spectrum(self, spectra: dict, active_id) -> None:
         try:
@@ -1362,6 +1370,7 @@ class MixABTestGPU:
                 ov.set_visible(not hide and self._spectrum_enabled)
                 if hide:
                     continue
+                ov.set_active(t["id"] == active_id)
                 raw = spectra.get(t["id"])
                 ov.update(raw, self._playing, n_bands)
         finally:
@@ -1610,7 +1619,7 @@ class MixABTestGPU:
         if idx >= len(self._tracks):
             return
         mx, my = dpg.get_mouse_pos(local=True)
-        wave_w = self._track_area_w - (METER_W if self._meter_enabled else 0)
+        wave_w = self._track_area_w - METER_W
         # Top-right corner of waveform area = remove button hit zone.
         # Guard: mx and my must be within plausible slot bounds to avoid
         # spurious removes from stale local-coord values.
@@ -1727,7 +1736,12 @@ class MixABTestGPU:
 
     def _toggle_meter(self) -> None:
         self._meter_enabled = not self._meter_enabled
-        self._rebuild_track_area()
+        for strip in self._slot_meters:
+            if strip:
+                strip.set_visible(self._meter_enabled)
+        for bar in self._slot_corr:
+            if bar:
+                bar.set_visible(self._meter_enabled and self._corr_enabled)
 
     def _toggle_lufs(self) -> None:
         self._lufs_enabled = not self._lufs_enabled
@@ -1743,7 +1757,9 @@ class MixABTestGPU:
 
     def _toggle_corr(self) -> None:
         self._corr_enabled = not self._corr_enabled
-        self._rebuild_track_area()
+        for bar in self._slot_corr:
+            if bar:
+                bar.set_visible(self._meter_enabled and self._corr_enabled)
 
     def _toggle_spectrum(self) -> None:
         self._spectrum_enabled = not self._spectrum_enabled

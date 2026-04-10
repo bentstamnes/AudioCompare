@@ -36,7 +36,9 @@ class SpectrumOverlay:
 
         h = active_color.lstrip("#")
         r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-        self._bar_color = (r, g, b, 180)
+        self._bar_color_active = (r, g, b, 180)
+        self._bar_color_dim    = (int(r * 0.5), int(g * 0.5), int(b * 0.5), int(180 * 0.6))
+        self._bar_color        = self._bar_color_active
 
         self._rects: list[int | str] = []
         self._bg_rects: list[int | str] = []
@@ -117,6 +119,17 @@ class SpectrumOverlay:
         for r in self._bg_rects + self._rects:
             try:
                 dpg.configure_item(r, show=visible)
+            except Exception:
+                pass
+
+    def set_active(self, is_active: bool) -> None:
+        color = self._bar_color_active if is_active else self._bar_color_dim
+        if color == self._bar_color:
+            return
+        self._bar_color = color
+        for r in self._rects:
+            try:
+                dpg.configure_item(r, fill=color)
             except Exception:
                 pass
 

@@ -51,13 +51,13 @@ class CorrelationBar:
         cx = x0 + METER_W // 2          # horizontal center
 
         # Background
-        dpg.draw_rectangle(
+        self._bg = dpg.draw_rectangle(
             (x0, y0), (x1, y1),
             color=(0, 0, 0, 0), fill=_COL_BG,
             parent=self._dl,
         )
         # Center reference tick
-        dpg.draw_line(
+        self._tick = dpg.draw_line(
             (cx, y0), (cx, y1),
             color=_COL_TICK, thickness=1,
             parent=self._dl,
@@ -103,3 +103,10 @@ class CorrelationBar:
             pmax=(max(x_max, x_min + 1), self._y1 - 2),
             fill=color,
         )
+
+    def set_visible(self, visible: bool) -> None:
+        for item in (self._bg, self._tick, self._bar):
+            try:
+                dpg.configure_item(item, show=visible)
+            except Exception:
+                pass
