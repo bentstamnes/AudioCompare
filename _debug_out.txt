@@ -1,0 +1,5 @@
+play_btn: rect_min=[6, 437] rect_size=[32, 32]
+time_lbl: rect_min=[46, 443] rect_size=[50, 15]
+mute_btn: rect_min=[649, 437] rect_size=[32, 32]
+vol_slider: rect_min=[687, 437] rect_size=[140, 21]
+dots_group: rect_min=[843, 437] rect_size=[8, 44]
