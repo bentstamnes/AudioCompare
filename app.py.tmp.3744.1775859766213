@@ -896,11 +896,6 @@ class MixABTestGPU:
                     label=f"{chk if self._audio_normalize else dot}Normalize audio levels",
                     callback=self._toggle_audio_normalize,
                 )
-            dpg.add_separator()
-            dpg.add_menu_item(
-                label=f"{chk if self._perf.enabled else dot}Perf logging  (-> logs/)",
-                callback=self._toggle_perf_logging,
-            )
 
     def _popup_mode_menu(self) -> None:
         if dpg.does_item_exist("mode_menu_popup"):
@@ -1413,14 +1408,12 @@ class MixABTestGPU:
                                    p2=(play_px, self._track_area_h))
 
         # Spectrum / spectrogram (every other frame to save CPU)
-        self._perf.begin_section("spectrum_dispatch")
         need_fft = self._spectrum_enabled or self._spectrogram_enabled or self._spectrogram_fullscreen
         if need_fft and not self._spectrum_pending:
             self._spectrum_frame_skip += 1
             if self._spectrum_frame_skip >= 2:
                 self._spectrum_frame_skip = 0
                 self._update_spectrum()
-        self._perf.end_section("spectrum_dispatch")
 
         # Playback end check
         if self._playing and pos >= max_dur - 0.05:
@@ -2153,14 +2146,6 @@ class MixABTestGPU:
         self._audio_normalize = not self._audio_normalize
         self._recalc_audio_gains()
 
-    def _toggle_perf_logging(self) -> None:
-        if self._perf.enabled:
-            self._perf.disable()
-            _log(f"Perf logging stopped: {self._perf.log_path}")
-        else:
-            path = self._perf.enable(self._perf_log_dir)
-            _log(f"Perf logging started: {path}")
-
     def _toggle_ui_scale(self) -> None:
         self._ui_scale = 2 if self._ui_scale == 1 else 1
         s = float(self._ui_scale)
@@ -2459,7 +2444,6 @@ class MixABTestGPU:
     # ── Close ─────────────────────────────────────────────────────────────────
 
     def _on_close(self) -> None:
-        self._perf.disable()
         self._save_prefs()
         self._engine.close()
         win_drop.unregister_drop_target(self._hwnd)

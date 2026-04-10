@@ -15,7 +15,9 @@
       "Bash(.venv/Scripts/python.exe -)",
       "Bash(timeout 40 .venv/Scripts/python.exe mixabtestgpu/_test_sweep.py)",
       "Bash(where ffmpeg:*)",
-      "Bash(ls \"f:/Dropbox/NorthBent/MixABTestGPU/\"*.exe)"
+      "Bash(ls \"f:/Dropbox/NorthBent/MixABTestGPU/\"*.exe)",
+      "Bash(.venv/Scripts/python.exe -c ':*)",
+      "Bash(.venv/Scripts/python.exe mixabtestgpu/analyze_perf.py)"
     ]
   }
 }

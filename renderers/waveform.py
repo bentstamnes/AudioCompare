@@ -67,6 +67,13 @@ class WaveformTexture:
         self._wave_px_count: int = 0   # number of columns that have content
         self._dirty = True
 
+        # Dirty-tracking: skip render+upload when nothing changed
+        self._last_play_px:   int         = -2   # -2 = sentinel "never rendered"
+        self._last_is_active: bool | None = None
+
+        # Pre-allocated scratch buffer for _draw_bars — avoids per-frame heap alloc
+        self._mark = np.zeros((self._height + 1, self._width), dtype=np.int8)
+
     @property
     def tag(self) -> int | str:
         return self._tag
@@ -80,13 +87,16 @@ class WaveformTexture:
         self._width  = width
         self._height = height
         self._buf    = np.empty((height, width, 4), dtype=np.float32)
+        self._mark   = np.zeros((height + 1, width), dtype=np.int8)
         # Replace DPG texture with a new one of the right size
         old_tag = self._tag
         flat = np.zeros(width * height * 4, dtype=np.float32)
         self._tag = dpg.add_dynamic_texture(width, height, flat, parent=self._reg)
         dpg.delete_item(old_tag)
-        # Recompute amplitudes at new width
+        # Force full re-render next frame
         self._dirty = True
+        self._last_play_px   = -2
+        self._last_is_active = None
 
     def set_wave_samples(
         self,
@@ -127,9 +137,10 @@ class WaveformTexture:
         col_max   = np.maximum.reduceat(abs_samps, i0_arr)[:px_count]
         amps      = np.maximum(1, (col_max / divisor * mid * 0.85)).astype(np.int32)
 
-        self._wave_amps   = amps
-        self._wave_px_count = px_count
-        self._dirty = True
+        self._wave_amps      = amps
+        self._wave_px_count  = px_count
+        self._dirty          = True
+        self._last_play_px   = -2   # force re-render next frame
 
     def render(
         self,
@@ -140,8 +151,21 @@ class WaveformTexture:
     ) -> None:
         """Render into the buffer and upload to GPU.
 
-        Call every frame when parameters change.
+        Skips the rebuild+upload when nothing visible has changed since the last
+        call.  Inactive tracks never change during playback (no played/unplayed
+        split), so they upload only once after load and on resize.
         """
+        # ── Dirty check: skip if nothing changed ─────────────────────────────
+        # Inactive tracks: play_px doesn't affect their appearance (single colour).
+        # Active track: only the playhead split position matters.
+        if not self._dirty:
+            effective_px = play_px if is_active else -1
+            if effective_px == self._last_play_px and is_active == self._last_is_active:
+                return
+        self._dirty          = False
+        self._last_is_active = is_active
+        self._last_play_px   = play_px if is_active else -1
+
         w, h = self._width, self._height
         buf  = self._buf
 
@@ -160,16 +184,16 @@ class WaveformTexture:
                 split = min(play_px, n_col)
                 if split > 0:
                     _draw_bars(buf, amps[:split], np.arange(split, dtype=np.int32),
-                               mid, h, self._active)
+                               mid, h, self._active, self._mark)
                 if split < n_col:
                     _draw_bars(buf, amps[split:n_col],
                                np.arange(split, n_col, dtype=np.int32),
-                               mid, h, self._inactive)
+                               mid, h, self._inactive, self._mark)
             else:
                 # Dim colour for non-active tracks, inactive for active-but-no-playhead
                 clr = self._inactive if is_active else self._dim
                 _draw_bars(buf, amps[:n_col], np.arange(n_col, dtype=np.int32),
-                           mid, h, clr)
+                           mid, h, clr, self._mark)
 
         # Playhead line (2 px wide, white)
         if show_playhead and play_px >= 0:
@@ -195,22 +219,26 @@ def _draw_bars(
     mid: int,
     h: int,
     color: np.ndarray,
+    mark: np.ndarray | None = None,
 ) -> None:
     """Draw vertical bars into buf for the given column indices and amplitudes.
 
     amps[i] is the half-height in pixels for column cols[i].
     Uses numpy fancy indexing — no Python loop.
+
+    mark: pre-allocated (h+1, W) int8 scratch buffer.  If supplied it is
+    zeroed and reused, avoiding a heap allocation on every call.
     """
     if len(amps) == 0:
         return
     tops    = np.maximum(0, mid - amps)      # shape (N,)
     bottoms = np.minimum(h - 1, mid + amps)  # shape (N,)
 
-    # Build index arrays for a vectorised scatter
-    # For each column, fill rows tops[i]..bottoms[i] with color.
-    # We use a cumsum trick to avoid a per-column loop.
-    # Approach: sparse mark array, then cumsum along rows.
-    mark = np.zeros((h + 1, buf.shape[1]), dtype=np.int8)
+    # Sparse mark + cumsum: avoids a per-column loop.
+    if mark is not None and mark.shape == (h + 1, buf.shape[1]):
+        mark[:] = 0   # clear pre-allocated buffer in-place (no allocation)
+    else:
+        mark = np.zeros((h + 1, buf.shape[1]), dtype=np.int8)
     np.add.at(mark, (tops,  cols), 1)
     np.add.at(mark, (bottoms + 1, cols), -1)
     mask = np.cumsum(mark[:h], axis=0).astype(bool)  # (H, W)
