@@ -41,7 +41,6 @@ class SpectrumOverlay:
         self._bar_color        = self._bar_color_active
 
         self._rects: list[int | str] = []
-        self._bg_rects: list[int | str] = []
         self._build_rects()
 
     def _build_rects(self) -> None:
@@ -51,14 +50,6 @@ class SpectrumOverlay:
         xo     = self._xo
         for i in range(n):
             rx = xo + i * bar_w
-            bg = dpg.draw_rectangle(
-                (rx, height), (rx + bar_w - 1, height),
-                color=(0, 0, 0, 0),
-                fill=(0, 0, 0, 140),
-                show=self._visible,
-                parent=self._dl,
-            )
-            self._bg_rects.append(bg)
             tag = dpg.draw_rectangle(
                 (rx, height), (rx + bar_w - 1, height),
                 color=(0, 0, 0, 0),
@@ -97,26 +88,22 @@ class SpectrumOverlay:
         for i, rect in enumerate(self._rects):
             bar_h = int(self._smooth[i] * h)
             rx    = xo + i * bar_w
-            dpg.configure_item(self._bg_rects[i],
-                               pmin=(rx,             h - bar_h),
-                               pmax=(rx + bar_w - 1, h))
             dpg.configure_item(rect,
                                pmin=(rx,             h - bar_h),
                                pmax=(rx + bar_w - 1, h))
 
     def _rebuild_rects(self) -> None:
-        for r in self._bg_rects + self._rects:
+        for r in self._rects:
             try:
                 dpg.delete_item(r)
             except Exception:
                 pass
         self._rects = []
-        self._bg_rects = []
         self._build_rects()
 
     def set_visible(self, visible: bool) -> None:
         self._visible = visible
-        for r in self._bg_rects + self._rects:
+        for r in self._rects:
             try:
                 dpg.configure_item(r, show=visible)
             except Exception:
@@ -137,10 +124,9 @@ class SpectrumOverlay:
         self._smooth = None
 
     def delete(self) -> None:
-        for r in self._bg_rects + self._rects:
+        for r in self._rects:
             try:
                 dpg.delete_item(r)
             except Exception:
                 pass
         self._rects = []
-        self._bg_rects = []

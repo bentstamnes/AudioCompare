@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python app.py)",
+      "Bash(ls \"f:\\\\Dropbox\\\\NorthBent\\\\MixABTestGPU\\\\mixabtestgpu\"/*.bat \"f:\\\\Dropbox\\\\NorthBent\\\\MixABTestGPU\"/*.bat)",
+      "Bash(python -c \"import sys; sys.path.insert\\(0,'mixabtestgpu'\\); import app\")",
+      "Bash(\"f:\\\\Dropbox\\\\NorthBent\\\\MixABTestGPU\\\\.venv\\\\Scripts\\\\python.exe\" -c \"import app\")",
+      "Bash(\"f:\\\\Dropbox\\\\NorthBent\\\\MixABTestGPU\\\\.venv\\\\Scripts\\\\python.exe\" main.py)",
+      "Bash(\"f:\\\\Dropbox\\\\NorthBent\\\\MixABTestGPU\\\\.venv\\\\Scripts\\\\python.exe\" -c \"import app; print\\('ok'\\)\")",
+      "Bash('f:\\\\Dropbox\\\\NorthBent\\\\MixABTestGPU\\\\.venv\\\\Scripts\\\\python.exe' -c ':*)",
+      "Bash(\"f:\\\\Dropbox\\\\NorthBent\\\\MixABTestGPU\\\\.venv\\\\Scripts\\\\python.exe\" -c \"import json; p=json.load\\(open\\('C:/Users/bents/AppData/Roaming/MixABTestGPU/prefs.json'\\)\\); p.pop\\('spectrogram_fullscreen',None\\); json.dump\\(p,open\\('C:/Users/bents/AppData/Roaming/MixABTestGPU/prefs.json','w'\\)\\)\")",
+      "Bash(\"f:\\\\Dropbox\\\\NorthBent\\\\MixABTestGPU\\\\.venv\\\\Scripts\\\\python.exe\" _test_sweep.py)",
+      "Bash(timeout 45 python _test_sweep.py)",
+      "Bash(timeout 45 .venv/Scripts/python.exe mixabtestgpu/_test_sweep.py)",
+      "Bash(.venv/Scripts/python.exe -)",
+      "Bash(timeout 40 .venv/Scripts/python.exe mixabtestgpu/_test_sweep.py)",
+      "Bash(where ffmpeg:*)",
+      "Bash(ls \"f:/Dropbox/NorthBent/MixABTestGPU/\"*.exe)"
+    ]
+  }
+}

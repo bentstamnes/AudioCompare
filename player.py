@@ -52,10 +52,43 @@ if _HAS_SD:
     _BAND_COUNTS  = np.array([max(1, hi - lo) for lo, hi in _BAND_BINS], dtype=np.float32)
     _BAND_LAST_HI = _BAND_BINS[-1][1]   # clip mag here so final band stops at 20 kHz
     del _fft_freqs, _band_edges, _bi, _lo, _hi
+
+    # ── Hi-res spectrogram — single 16384-point FFT, 512 log-spaced bands ────
+    # 16384 pts at 48 kHz → 2.93 Hz/bin, 341 ms window.
+    # 2× better low-end frequency resolution vs 8192, without the temporal
+    # smearing of larger windows (65536 = 1.36 s → muddy bass transients).
+    # Only used by sample_spectrum_hires(); never changed at runtime.
+    _SPECTRO_FFT_SIZE  = 16384
+    _SPECTRO_N_BANDS   = 512
+    _SPECTRO_HANN      = np.hanning(_SPECTRO_FFT_SIZE).astype(np.float32)
+
+    # Derivative window for frequency reassignment: h_D[n] = dh/dn
+    # Centred finite difference; endpoints use one-sided (h outside window = 0).
+    # Error < 2% for windows this size (Flandrin et al.).
+    _spectro_h_tmp          = _SPECTRO_HANN  # alias
+    _SPECTRO_H_D            = np.empty(_SPECTRO_FFT_SIZE, dtype=np.float32)
+    _SPECTRO_H_D[1:-1]      = (_spectro_h_tmp[2:] - _spectro_h_tmp[:-2]) * 0.5
+    _SPECTRO_H_D[0]         = _spectro_h_tmp[1] * 0.5   # h[-1] = 0 outside window
+    _SPECTRO_H_D[-1]        = -_spectro_h_tmp[-2] * 0.5  # h[N] = 0 outside window
+    del _spectro_h_tmp
+
+    _spectro_freqs     = np.fft.rfftfreq(_SPECTRO_FFT_SIZE, d=1.0 / SAMPLERATE)
+    _spectro_edges     = np.logspace(np.log10(20.0), np.log10(20000.0), _SPECTRO_N_BANDS + 1)
+    _spectro_bins      = []
+    for _bi in range(_SPECTRO_N_BANDS):
+        _lo = int(np.searchsorted(_spectro_freqs, _spectro_edges[_bi]))
+        _hi = int(np.searchsorted(_spectro_freqs, _spectro_edges[_bi + 1]))
+        _spectro_bins.append((_lo, max(_hi, _lo + 1)))
+    _SPECTRO_BAND_START   = np.array([lo for lo, hi in _spectro_bins], dtype=np.intp)
+    _SPECTRO_BAND_COUNTS  = np.array([max(1, hi - lo) for lo, hi in _spectro_bins], dtype=np.float32)
+    _SPECTRO_BAND_LAST_HI = _spectro_bins[-1][1]
+    del _spectro_freqs, _spectro_edges, _spectro_bins, _bi, _lo, _hi
 else:
     _FADE_IN = _FADE_OUT = None
     _FFT_SIZE = _N_BANDS = _HANN_WIN = _BAND_BINS = None
     _BAND_START = _BAND_COUNTS = _BAND_LAST_HI = None
+    _SPECTRO_FFT_SIZE = _SPECTRO_N_BANDS = _SPECTRO_HANN = _SPECTRO_H_D = None
+    _SPECTRO_BAND_START = _SPECTRO_BAND_COUNTS = _SPECTRO_BAND_LAST_HI = None
 
 
 class AudioEngine:
@@ -261,6 +294,137 @@ class AudioEngine:
             sums   = np.add.reduceat(mag[:_BAND_LAST_HI], _BAND_START)
             bands  = (sums[:_N_BANDS] / _BAND_COUNTS).astype(np.float32)
             result[tid] = 20.0 * np.log10(np.maximum(bands, 1e-6))
+        return result
+
+    def sample_spectrum_hires(self, track_ids=None):
+        """Return {track_id: np.ndarray(512,)} using frequency-reassigned spectrogram.
+
+        16384-point FFT, 512 log-spaced bands.  Each bin's energy is scattered to
+        its instantaneous frequency (centre of gravity) rather than its geometric
+        bin centre, sharpening harmonic lines and reducing smearing.
+
+        Algorithm (Auger-Flandrin frequency reassignment):
+          X   = rfft(x * h)     — standard STFT
+          X_D = rfft(x * h_D)   — STFT with derivative window
+          k_hat = k + Im(X_D * conj(X)) / |X|² * N/(2π)   — reassigned bin
+          Scatter |X[k]| to reassigned_amp[k_hat], then band-average.
+        """
+        if not _HAS_SD:
+            return {}
+        pos     = self._pos
+        result  = {}
+        buffers = self._buffers if track_ids is None else {tid: self._buffers[tid] for tid in track_ids if tid in self._buffers}
+        n_bins  = _SPECTRO_FFT_SIZE // 2 + 1
+        scale   = 2.0 / _SPECTRO_FFT_SIZE
+        inv_2pi = _SPECTRO_FFT_SIZE / (2.0 * np.pi)
+        k_src   = np.arange(n_bins, dtype=np.int32)
+
+        for tid, buf in list(buffers.items()):
+            # Skip frames where the window extends before the audio start — those
+            # require zero-padding the left half, which smears the onset blob.
+            if pos < _SPECTRO_FFT_SIZE // 2:
+                continue
+            start = pos - _SPECTRO_FFT_SIZE // 2
+            end   = min(len(buf), start + _SPECTRO_FFT_SIZE)
+            chunk = buf[start:end]
+            n     = len(chunk)
+            if n < 64:
+                result[tid] = np.full(_SPECTRO_N_BANDS, -90.0, dtype=np.float32)
+                continue
+            mono = chunk.mean(axis=1) if chunk.ndim > 1 else chunk.copy()
+            if n < _SPECTRO_FFT_SIZE:
+                padded = np.zeros(_SPECTRO_FFT_SIZE, dtype=np.float32)
+                padded[:n] = mono
+                mono = padded
+
+            # Two FFTs — standard and derivative-windowed
+            X   = np.fft.rfft(mono * _SPECTRO_HANN)
+            X_D = np.fft.rfft(mono * _SPECTRO_H_D)
+
+            # |X|² — used for reassignment weight and energy threshold
+            mag_sq = X.real * X.real + X.imag * X.imag
+
+            # Im(X_D * conj(X)) = X_D.imag*X.real - X_D.real*X.imag
+            num_im = X_D.imag * X.real - X_D.real * X.imag
+
+            # Frequency reassignment with fractional scatter.
+            # Using np.round() causes nearby bins converging on the same true
+            # frequency to round to different integers → multiple parallel lines.
+            # Fractional scatter splits each bin's energy between floor/ceil,
+            # so all bins targeting the same frequency naturally merge.
+            safe       = mag_sq > 1e-10
+            denom      = np.where(safe, mag_sq, 1.0)
+            # Sign is MINUS: sidelobes are pushed TOWARD the true peak.
+            # PLUS was wrong — it scattered sidelobes away, creating ghost lines.
+            k_hat_f    = k_src - num_im / denom * inv_2pi   # fractional bin, no round
+            k_lo       = np.clip(np.floor(k_hat_f).astype(np.int32), 0, n_bins - 1)
+            k_hi       = np.clip(k_lo + 1,                            0, n_bins - 1)
+            frac       = np.clip((k_hat_f - np.floor(k_hat_f)).astype(np.float32), 0.0, 1.0)
+
+            amp = np.abs(X) * scale
+            amp = np.where(safe, amp, 0.0)
+            reassigned = np.zeros(n_bins, dtype=np.float32)
+            np.add.at(reassigned, k_lo, amp * (1.0 - frac))
+            np.add.at(reassigned, k_hi, amp * frac)
+
+            # Band-average and convert to dBFS
+            sums  = np.add.reduceat(reassigned[:_SPECTRO_BAND_LAST_HI], _SPECTRO_BAND_START)
+            bands = (sums[:_SPECTRO_N_BANDS] / _SPECTRO_BAND_COUNTS).astype(np.float32)
+            result[tid] = 20.0 * np.log10(np.maximum(bands, 1e-6))
+        return result
+
+    def sample_spectrum_fullscreen(self, track_ids=None):
+        """Return {tid: np.ndarray(n_bins,)} — raw reassigned linear magnitudes.
+
+        Returns the full reassigned amplitude spectrum without band-averaging,
+        so SpectrogramStrip can map each pixel row to its exact frequency bin
+        via log-frequency interpolation.  Array length = _SPECTRO_FFT_SIZE//2 + 1.
+        Values are linear amplitude (not dBFS) so the strip can interpolate cleanly.
+        """
+        if not _HAS_SD:
+            return {}
+        pos     = self._pos
+        result  = {}
+        buffers = self._buffers if track_ids is None else {tid: self._buffers[tid] for tid in track_ids if tid in self._buffers}
+        n_bins  = _SPECTRO_FFT_SIZE // 2 + 1
+        scale   = 2.0 / _SPECTRO_FFT_SIZE
+        inv_2pi = _SPECTRO_FFT_SIZE / (2.0 * np.pi)
+        k_src   = np.arange(n_bins, dtype=np.int32)
+
+        for tid, buf in list(buffers.items()):
+            if pos < _SPECTRO_FFT_SIZE // 2:
+                continue
+            start = pos - _SPECTRO_FFT_SIZE // 2
+            end   = min(len(buf), start + _SPECTRO_FFT_SIZE)
+            chunk = buf[start:end]
+            n     = len(chunk)
+            if n < 64:
+                result[tid] = np.zeros(n_bins, dtype=np.float32)
+                continue
+            mono = chunk.mean(axis=1) if chunk.ndim > 1 else chunk.copy()
+            if n < _SPECTRO_FFT_SIZE:
+                padded = np.zeros(_SPECTRO_FFT_SIZE, dtype=np.float32)
+                padded[:n] = mono
+                mono = padded
+
+            X   = np.fft.rfft(mono * _SPECTRO_HANN)
+            X_D = np.fft.rfft(mono * _SPECTRO_H_D)
+
+            mag_sq  = X.real * X.real + X.imag * X.imag
+            num_im  = X_D.imag * X.real - X_D.real * X.imag
+            safe    = mag_sq > 1e-10
+            denom   = np.where(safe, mag_sq, 1.0)
+            k_hat_f = k_src - num_im / denom * inv_2pi   # MINUS: pulls sidelobes toward true freq
+            k_lo    = np.clip(np.floor(k_hat_f).astype(np.int32), 0, n_bins - 1)
+            k_hi    = np.clip(k_lo + 1,                            0, n_bins - 1)
+            frac    = np.clip((k_hat_f - np.floor(k_hat_f)).astype(np.float32), 0.0, 1.0)
+
+            amp = np.abs(X) * scale
+            amp = np.where(safe, amp, 0.0)
+            reassigned = np.zeros(n_bins, dtype=np.float32)
+            np.add.at(reassigned, k_lo, amp * (1.0 - frac))
+            np.add.at(reassigned, k_hi, amp * frac)
+            result[tid] = reassigned   # raw linear magnitudes, NOT dBFS
         return result
 
     def sample_levels(self, n_frames=1024):
