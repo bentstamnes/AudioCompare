@@ -1,5 +1,5 @@
 """
-analyze_perf.py — Post-run analysis of MixABTestGPU performance logs.
+analyze_perf.py -- Post-run analysis of MixABTestGPU performance logs.
 
 Usage:
     python analyze_perf.py                  # reads latest CSV in logs/
@@ -10,10 +10,10 @@ Output: a table of mean / p95 / max per section, plus a breakdown showing
 what fraction of total tick time each section accounts for.
 
 Interpretation guide (printed at the end):
-  tick_mean_ms  > 8ms  at 60fps → frame budget exceeded → stutter risk
-  waveform      > 50% of tick  → texture upload is the bottleneck
-  meters        > 20% of tick  → sample_levels / correlation too expensive
-  ctrl_spacer   > 5%  of tick  → DPG query overhead, worth caching
+  tick_mean_ms  > 8ms  at 60fps -> frame budget exceeded -> stutter risk
+  waveform      > 50% of tick  -> texture upload is the bottleneck
+  meters        > 20% of tick  -> sample_levels / correlation too expensive
+  ctrl_spacer   > 5%  of tick  -> DPG query overhead, worth caching
 """
 
 from __future__ import annotations
@@ -128,9 +128,9 @@ def analyze(path: str, verbose: bool = True) -> dict:
 
         print()
         if mean_tick > _FRAME_BUDGET_MS * 0.75:
-            print("  [!] Mean tick exceeds 75% of frame budget — stutter very likely.")
+            print("  [!] Mean tick exceeds 75% of frame budget -- stutter very likely.")
         elif mean_tick > _FRAME_BUDGET_MS * 0.5:
-            print("  [!] Mean tick exceeds 50% of frame budget — stutter risk at higher loads.")
+            print("  [!] Mean tick exceeds 50% of frame budget -- stutter risk at higher loads.")
         else:
             print("  [ok] Mean tick within frame budget.")
 

@@ -124,11 +124,10 @@ class WaveformTexture:
         height = max(1, height)
         if width == self._width and height == self._height:
             return
-        self._width      = width
-        self._height     = height
-        self._buf_played = np.empty((height, width, 3), dtype=np.float32)
-        self._buf_rest   = np.empty((height, width, 3), dtype=np.float32)
-        self._mark       = np.zeros((height + 1, width), dtype=np.int8)
+        self._width  = width
+        self._height = height
+        self._buf    = np.empty((height, width, 3), dtype=np.float32)
+        self._mark   = np.zeros((height + 1, width), dtype=np.int8)
 
         flat = np.zeros(width * height * 3, dtype=np.float32)
         old_played = self._tag_played
@@ -194,28 +193,28 @@ class WaveformTexture:
 
     def _build_upload_played(self) -> None:
         """Build full waveform in active colour and upload to tag_played."""
-        self._buf_played[:] = self._bg
+        self._buf[:] = self._bg
         if self._wave_amps is not None and self._wave_px_count > 0:
             mid   = self._height // 2
             n_col = min(self._wave_px_count, self._width)
-            _draw_bars(self._buf_played, self._wave_amps[:n_col],
+            _draw_bars(self._buf, self._wave_amps[:n_col],
                        np.arange(n_col, dtype=np.int32),
                        mid, self._height, self._active, self._mark)
         if dpg.does_item_exist(self._tag_played):
-            dpg.set_value(self._tag_played, self._buf_played.ravel())
+            dpg.set_value(self._tag_played, self._buf.ravel())
 
     def _build_upload_rest(self) -> None:
         """Build full waveform in inactive/dim colour and upload to tag_rest."""
-        self._buf_rest[:] = self._bg
+        self._buf[:] = self._bg
         if self._wave_amps is not None and self._wave_px_count > 0:
             mid   = self._height // 2
             n_col = min(self._wave_px_count, self._width)
             clr   = self._inactive if self._is_active else self._dim
-            _draw_bars(self._buf_rest, self._wave_amps[:n_col],
+            _draw_bars(self._buf, self._wave_amps[:n_col],
                        np.arange(n_col, dtype=np.int32),
                        mid, self._height, clr, self._mark)
         if dpg.does_item_exist(self._tag_rest):
-            dpg.set_value(self._tag_rest, self._buf_rest.ravel())
+            dpg.set_value(self._tag_rest, self._buf.ravel())
 
     def delete(self) -> None:
         """Remove both DPG textures."""

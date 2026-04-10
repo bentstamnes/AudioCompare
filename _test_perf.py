@@ -90,9 +90,10 @@ def main() -> int:
 
         # ── Viewport resize (frame 3 — after first-frame setup fires) ─────────
         if frame_count == 3 and args.width > 0 and args.height > 0 and not resize_done:
-            dpg.configure_viewport(width=args.width, height=args.height)
+            dpg.set_viewport_width(args.width)
+            dpg.set_viewport_height(args.height)
             resize_done = True
-            print(f"[frame {frame_count}] viewport → {args.width}×{args.height}", flush=True)
+            print(f"[frame {frame_count}] viewport -> {args.width}x{args.height}", flush=True)
 
         # ── Start perf + playback after warmup ────────────────────────────────
         if frame_count == WARMUP_FRAMES and not perf_started:
@@ -105,21 +106,19 @@ def main() -> int:
             w = dpg.get_viewport_width()
             h = dpg.get_viewport_height()
             print(f"[frame {frame_count}] perf logging started  "
-                  f"viewport={w}×{h}  tracks={len(app._tracks)}", flush=True)
+                  f"viewport={w}x{h}  tracks={len(app._tracks)}", flush=True)
 
         # ── Stop measurement ──────────────────────────────────────────────────
         if frame_count == WARMUP_FRAMES + MEASURE_FRAMES and not perf_stopped:
             perf_stopped = True
             app._perf.disable()
-            print(f"[frame {frame_count}] perf logging stopped → {os.path.basename(csv_path)}", flush=True)
+            print(f"[frame {frame_count}] perf logging stopped -> {os.path.basename(csv_path)}", flush=True)
 
         # ── Exit ──────────────────────────────────────────────────────────────
         if frame_count >= EXIT_FRAME:
             dpg.stop_dearpygui()
 
-    dpg.destroy_context()
-
-    # ── Inline analysis ───────────────────────────────────────────────────────
+    # ── Inline analysis (before destroy — destroy can block on GPU cleanup) ──
     if not csv_path or not os.path.isfile(csv_path):
         # Fall back to most recent file in logs/
         candidates = sorted(glob.glob(os.path.join(_HERE, "logs", "perf_*.csv")))
@@ -128,10 +127,16 @@ def main() -> int:
     if csv_path and os.path.isfile(csv_path):
         from analyze_perf import analyze
         analyze(csv_path)
-        return 0
+        exit_code = 0
     else:
         print("ERROR: no CSV file was written.", flush=True)
-        return 1
+        exit_code = 1
+
+    # Destroy context on a daemon thread — GPU teardown can stall the main
+    # thread long enough for Windows to show "Not Responding".  Results are
+    # already printed, so we exit as soon as the analysis is done.
+    threading.Thread(target=dpg.destroy_context, daemon=True).start()
+    return exit_code
 
 
 if __name__ == "__main__":

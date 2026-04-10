@@ -23,15 +23,7 @@
       "Bash(ls .venv/Scripts/*.exe)",
       "Bash(ls *.py)",
       "Bash(timeout 75 \"../.venv/Scripts/python.exe\" _test_perf.py --label \"Option B: dual static textures\" --width 2560 --height 1440)",
-      "Bash(.venv/Scripts/python.exe -c \"import dearpygui.dearpygui as dpg; print\\(dpg.__version__\\); help\\(dpg.configure_viewport\\)\")",
-      "Bash(.venv/Scripts/python.exe -c \"import dearpygui; print\\(dearpygui.__version__\\)\")",
-      "Bash(PYTHONIOENCODING=utf-8 \"../.venv/Scripts/python.exe\" analyze_perf.py)",
-      "Bash(PYTHONIOENCODING=utf-8 \"../.venv/Scripts/python.exe\" analyze_perf.py --all)",
-      "Bash(timeout 55 \"../.venv/Scripts/python.exe\" _test_perf.py --label \"Option B clean run\" --width 2560 --height 1440)",
-      "Bash(ls \"f:/Dropbox/NorthBent/MixABTestGPU/\"*.png)",
-      "Bash(ls \"f:/Dropbox/NorthBent/MixABTestGPU/mixabtestgpu/\"*.png)",
-      "Bash(timeout 55 \"../.venv/Scripts/python.exe\" _test_perf.py --label \"dual tex + separate buffers\" --width 2560 --height 1440)",
-      "Bash(\"../.venv/Scripts/python.exe\" analyze_perf.py --all)"
+      "Bash(.venv/Scripts/python.exe -c \"import dearpygui.dearpygui as dpg; print\\(dpg.__version__\\); help\\(dpg.configure_viewport\\)\")"
     ]
   }
 }

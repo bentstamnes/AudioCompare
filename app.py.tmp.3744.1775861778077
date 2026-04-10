@@ -781,14 +781,7 @@ class MixABTestGPU:
         dl = dpg.add_drawlist(tag="null_dl", width=vw, height=h, parent=parent_tag)
         dpg.draw_rectangle((0, 0), (vw, h), color=(0,0,0,0), fill=bg,
                            tag="null_bg", parent=dl)
-        dpg.draw_image(tex.tag_rest,   (0, 0), (vw, h),
-                       uv_min=(0, 0), uv_max=(1, 1),
-                       tag="null_wave_rest",   parent=dl)
-        dpg.draw_image(tex.tag_played, (0, 0), (0,   h),
-                       uv_min=(0, 0), uv_max=(0, 1),
-                       tag="null_wave_played", parent=dl)
-        dpg.draw_line((0, 0), (0, h), color=(255, 255, 255, 220), thickness=2,
-                      tag="null_play_line", parent=dl)
+        dpg.draw_image(tex.tag, (0, 0), (vw, h), tag="null_wave_img", parent=dl)
 
         dpg.add_text("[NULL]", pos=(8, 4), color=list(_DIM_FG),
                      tag="null_label", parent=parent_tag)
@@ -1344,7 +1337,7 @@ class MixABTestGPU:
         dpg.configure_item(self._tag_time_lbl,
                            default_value=f"{_fmt_time(pos)} / {_fmt_time(max_dur)}")
 
-        # Waveform: update UV split on pre-built static textures — no GPU upload
+        # Waveform textures: render each slot using actual rendered dimensions
         self._perf.begin_section("waveform")
         for idx, t in enumerate(self._tracks):
             tex = self._slot_textures[idx]
@@ -1352,68 +1345,37 @@ class MixABTestGPU:
                 continue
             slot_tag = f"slot_win_{idx}"
             if dpg.does_item_exist(slot_tag):
-                sz     = dpg.get_item_rect_size(slot_tag)
+                sz = dpg.get_item_rect_size(slot_tag)
                 slot_w = max(1, int(sz[0]))
                 slot_h = max(1, int(sz[1]))
             else:
                 slot_w = self._track_area_w
                 slot_h = max(1, (self._track_area_h - _TRACK_PAD * (MAX_TRACKS - 1)) // MAX_TRACKS)
-            wave_w  = slot_w - METER_W
+            wave_w = slot_w - METER_W
             play_px = int(wave_w * frac) if max_dur > 0 else -1
-
-            played_tag = f"slot_wave_played_{idx}"
-            rest_tag   = f"slot_wave_rest_{idx}"
-            is_active  = (idx == self._active)
-
-            if is_active and play_px >= 0:
-                split      = min(play_px, wave_w)
-                split_frac = split / wave_w if wave_w > 0 else 0.0
-                if dpg.does_item_exist(played_tag):
-                    dpg.configure_item(played_tag,
-                                       pmin=(0, 0), pmax=(split, slot_h),
-                                       uv_min=(0, 0), uv_max=(split_frac, 1))
-                if dpg.does_item_exist(rest_tag):
-                    dpg.configure_item(rest_tag,
-                                       pmin=(split, 0), pmax=(wave_w, slot_h),
-                                       uv_min=(split_frac, 0), uv_max=(1, 1))
-            else:
-                # Inactive track or no playhead: show full rest texture
-                if dpg.does_item_exist(played_tag):
-                    dpg.configure_item(played_tag,
-                                       pmin=(0, 0), pmax=(0, slot_h),
-                                       uv_min=(0, 0), uv_max=(0, 1))
-                if dpg.does_item_exist(rest_tag):
-                    dpg.configure_item(rest_tag,
-                                       pmin=(0, 0), pmax=(wave_w, slot_h),
-                                       uv_min=(0, 0), uv_max=(1, 1))
-
+            tex.render(
+                is_active=(idx == self._active),
+                play_px=play_px,
+                show_playhead=False,   # playhead drawn as separate draw_line above dim/spectrogram
+            )
             line_tag = f"slot_play_line_{idx}"
             if play_px >= 0 and dpg.does_item_exist(line_tag):
                 dpg.configure_item(line_tag, p1=(play_px, 0), p2=(play_px, slot_h))
 
-        # Null slot waveform: UV split + playhead line
+        # Null slot waveform
         if self._null_mode and self._null_tex and self._null_wave_raw:
             slot_tag = "slot_win_3"
             if dpg.does_item_exist(slot_tag):
-                sz     = dpg.get_item_rect_size(slot_tag)
+                sz = dpg.get_item_rect_size(slot_tag)
                 null_w = max(1, int(sz[0]))
-                null_h = max(1, int(sz[1]))
             else:
                 null_w = self._track_area_w
-                null_h = max(1, (self._track_area_h - _TRACK_PAD * (MAX_TRACKS - 1)) // MAX_TRACKS)
-            play_px    = int(null_w * frac)
-            split_frac = play_px / null_w if null_w > 0 else 0.0
-            if dpg.does_item_exist("null_wave_played"):
-                dpg.configure_item("null_wave_played",
-                                   pmin=(0, 0), pmax=(play_px, null_h),
-                                   uv_min=(0, 0), uv_max=(split_frac, 1))
-            if dpg.does_item_exist("null_wave_rest"):
-                dpg.configure_item("null_wave_rest",
-                                   pmin=(play_px, 0), pmax=(null_w, null_h),
-                                   uv_min=(split_frac, 0), uv_max=(1, 1))
-            if dpg.does_item_exist("null_play_line"):
-                dpg.configure_item("null_play_line",
-                                   p1=(play_px, 0), p2=(play_px, null_h))
+            play_px = int(null_w * frac)
+            self._null_tex.render(
+                is_active=True,
+                play_px=play_px,
+                show_playhead=True,
+            )
         self._perf.end_section("waveform")
 
         # Meters
@@ -1750,15 +1712,6 @@ class MixABTestGPU:
             return
         old          = self._active
         self._active = idx
-
-        # Rebuild rest textures for the two affected slots (once per switch)
-        if old != idx:
-            old_tex = self._slot_textures[old] if 0 <= old < len(self._slot_textures) else None
-            new_tex = self._slot_textures[idx]
-            if old_tex:
-                old_tex.set_active(False)
-            if new_tex:
-                new_tex.set_active(True)
 
         if self._null_mode and self._null_playing_null:
             new_cand = self._null_candidate_idx()
