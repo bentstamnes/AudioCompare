@@ -2495,8 +2495,6 @@ class MixABTestGPU:
     def _on_key_left(self, *_)  -> None: self._seek_relative(-5.0)
     def _on_key_right(self, *_) -> None: self._seek_relative(+5.0)
     def _on_key_m(self, *_)     -> None: self._toggle_mute()
-    def _on_key_home(self, *_)  -> None: self._seek_to(0.0)
-    def _on_key_end(self, *_)   -> None: self._seek_to(self._max_dur)
 
     def _on_key_ctrl_o(self, *_) -> None:
         if dpg.is_key_down(dpg.mvKey_LControl) or dpg.is_key_down(dpg.mvKey_RControl):
@@ -2522,8 +2520,6 @@ class MixABTestGPU:
                         "  Space          Play / Pause\n"
                         "  Up / Down      Switch active channel\n"
                         "  Left / Right   Seek +-5 seconds\n"
-                        "  Home           Go to start\n"
-                        "  End            Go to end\n"
                         "  M              Mute / unmute\n"
                         "  Ctrl + O       Open file(s)\n"
                         "  Ctrl + Q       Quit\n"

@@ -75,6 +75,34 @@ mask = mag > (mag.max(axis=1, keepdims=True) * 0.01)
 
 ---
 
+## Short layer (standard FFT onset) — disabled (2026-04-12)
+
+The short 1024-FFT onset layer was originally added to boost transient/kick visibility.
+It was **disabled** after it was confirmed to produce horizontal dash artifacts on any
+slowly-rising signal (including a clean linear frequency sweep):
+
+**Root cause**: EMA background subtraction (alpha=0.92) has a ~12-column lag.  As a
+linear sweep approaches a given FFT bin from below, that bin's magnitude rises over
+~20 columns.  For each of those columns the onset `mag - bg > 0`, and it scatters at
+the bin's fixed nominal row.  This creates a horizontal dash at a fixed frequency for
+every bin the sweep passes through — visible as a staircase pattern to the left of the
+main sweep line.
+
+**Why it can't be fixed with a higher relative gate**: with a linearly rising signal,
+`onset/mag` ≈ `lag/t` — this ratio is bounded above 0.5 near the peak regardless of
+gate threshold (verified analytically with alpha=0.92 and 22-column bin dwell time).
+
+**Why the long layer doesn't have this problem**: reassignment re-locates energy to the
+instantaneous frequency via `omega_hat`, so a sweep bin scatters to wherever the sweep
+actually *is* (tracked continuously), not a fixed nominal row.
+
+**Status**: `_SHORT_WEIGHT = 0.0`.  The long reassigned layer at HOP_SIZE=256 (5.8 ms/
+col) provides adequate transient resolution for kick drums.  The short layer code
+remains in place; it can be re-enabled only if an onset algorithm immune to slow-rising
+signals is developed.
+
+---
+
 ## Current implementation status (as of 2026-04-11)
 
 `renderers/spectrogram.py` → `compute_static()` uses standard `|rfft|²`. Correct frequency mapping and UV-scroll architecture are in place (prerequisite work done). Reassignment is the next step — only `compute_static()` needs to change; rendering path is untouched.

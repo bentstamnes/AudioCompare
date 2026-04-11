@@ -304,7 +304,8 @@ def compute_static(
         np.add.at(out_short, (row_flat_s[valid_s], col_flat_s[valid_s]), scatter_s[valid_s])
 
         # ── Blend ─────────────────────────────────────────────────────────────
-        out_lin = out_long + _SHORT_WEIGHT * out_short
+        # NOTE: _SHORT_WEIGHT set to 0.0 below for diagnostic — REVERT after test
+        out_lin = out_long + 0.0 * out_short
 
         # ── Per-band per-column gate ───────────────────────────────────────────
         # Applied after blending, on the accumulated out_lin.  Each row must

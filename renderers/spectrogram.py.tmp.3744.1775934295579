@@ -85,21 +85,7 @@ _FFT_SIZE_S  = 1024
 _N_BINS_S    = _FFT_SIZE_S // 2 + 1              # 513
 _FFT_NORM_S  = float(_FFT_SIZE_S // 4)
 _HANN_S      = np.hanning(_FFT_SIZE_S).astype(np.float32)
-# Short layer disabled: the EMA onset detection fires on any slowly-rising
-# signal (including a linear frequency sweep) because each bin sees a non-zero
-# onset for ~20 columns as the sweep approaches from below.  This produces
-# horizontal dashes to the left of the main sweep line.  The long reassigned
-# layer at HOP_SIZE=256 (5.8 ms/col) already resolves kick-drum transients
-# adequately.  Set > 0 only if future onset logic is made sweep-immune.
-_SHORT_WEIGHT = 0.0
-
-# Pre-scatter per-column relative gate (long layer only).
-# Each bin must exceed this fraction of the column's peak magnitude to be
-# scattered.  This is a global per-column test (not per-band), so harmonics
-# that are weaker than the fundamental are suppressed even when they are the
-# only content in their frequency band — something the per-band gate cannot do.
-# Raise to suppress more harmonics; lower to keep more harmonic detail.
-_PRE_SCATTER_GATE = 0.05
+_SHORT_WEIGHT = 0.40
 
 # ── Log-frequency axis ────────────────────────────────────────────────────────
 _LOG_RANGE = float(np.log(_FS_FREQ_HI / _FS_FREQ_LO))   # ln(20000/20) ≈ 6.9
@@ -237,20 +223,9 @@ def compute_static(
         # window — for a frequency sweep these appear as horizontal precursor lines
         # to the left of the main sweep line.  Reject them.
         t_hat_offset = (np.real(X_th / denom) - _FFT_SIZE // 2).astype(np.float32)
-        # Tight causal gate: only keep bins whose energy centroid is at or behind
-        # the window centre.  FFT_SIZE//64 ≈ 1.5 ms tolerance handles floating-
-        # point jitter on stationary sinusoids while aggressively cutting the
-        # precursor "ghost" lines caused by a rising sweep appearing in the
-        # future half of the analysis window.
-        causal       = (t_hat_offset <= _FFT_SIZE // 64).ravel()  # ≤ +64 samples
+        causal       = (t_hat_offset <= _FFT_SIZE // 8).ravel()   # ≤ +512 samples ahead
 
-        # Pre-scatter relative gate: only scatter bins above _PRE_SCATTER_GATE
-        # fraction of the column's peak magnitude.  Uses raw mag (before mag**1.5),
-        # so the threshold is in linear amplitude space.
-        col_peak_l = mag.max(axis=1, keepdims=True)           # (t_ncols, 1)
-        pre_gate   = (mag > col_peak_l * _PRE_SCATTER_GATE).ravel()
-
-        valid     = (mag > _MAG_GATE).ravel() & causal & pre_gate
+        valid     = (mag > _MAG_GATE).ravel() & causal
 
         freq_hat  = omega_hat * (sample_rate / float(_FFT_SIZE))
         freq_hat  = np.clip(freq_hat, _FS_FREQ_LO, _FS_FREQ_HI)
@@ -306,20 +281,15 @@ def compute_static(
         # ── Blend ─────────────────────────────────────────────────────────────
         out_lin = out_long + _SHORT_WEIGHT * out_short
 
-        # ── Per-band per-column gate ───────────────────────────────────────────
-        # Applied after blending, on the accumulated out_lin.  Each row must
-        # exceed this fraction of its band's column max to survive.  0.10 is
-        # loose enough to keep clean sub-bass sustained notes (which caused gaps
-        # at 0.25) while still suppressing faint noise rows in quiet bands.
-        _N_BANDS          = 6
-        _BAND_GATE_THRESH = 0.10
-        band_h = max(1, height // _N_BANDS)
+        # ── Per-band floor (6 bands, 1%) ──────────────────────────────────────
+        _N_BANDS = 6
+        band_h   = max(1, height // _N_BANDS)
         for b in range(_N_BANDS):
             r0   = b * band_h
             r1   = height if b == _N_BANDS - 1 else r0 + band_h
             band = out_lin[r0:r1, :]
             bmax = np.maximum(band.max(axis=0, keepdims=True), 1e-10)
-            out_lin[r0:r1, :] *= (band > bmax * _BAND_GATE_THRESH)
+            out_lin[r0:r1, :] *= (band > bmax * 0.01)
 
         # ── dBFS + spectral tilt → LUT → RGBA ─────────────────────────────────
         db       = 20.0 * np.log10(np.maximum(out_lin, 1e-7))
