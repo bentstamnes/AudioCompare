@@ -283,7 +283,7 @@ class MixABTestGPU:
         self._dot_clicked = False  # debounce
 
         self._tag_processing_lbl = "processing_lbl"
-        self._processing_tasks: dict[str, int] = {}   # task_name → active count
+        self._processing_count   = 0   # incremented per active background task
 
         self._build_ui()
 
@@ -1078,8 +1078,8 @@ class MixABTestGPU:
             for i in range(idx):
                 self._refresh_track_waveform(i)
 
-        self._inc_processing("audio")
-        self._inc_processing("waveform")
+        self._inc_processing()   # decode
+        self._inc_processing()   # waveform
         self._decode_executor.submit(self._decode_thread, track_id, path)
         threading.Thread(target=self._wave_thread,
                          args=(idx, path), daemon=True).start()
@@ -1107,11 +1107,10 @@ class MixABTestGPU:
         except Exception as e:
             import traceback
             self._post(_log, f"_decode_thread EXCEPTION id={track_id}: {traceback.format_exc()}")
-            self._post(self._dec_processing, "audio")
 
     def _on_decode_done(self, track_id: int, data, audio_peak: float) -> None:
         _log(f"_on_decode_done id={track_id} data={'OK shape='+str(data.shape) if data is not None else 'None'}")
-        self._dec_processing("audio")
+        self._dec_processing()   # decode done
         for t in self._tracks:
             if t["id"] == track_id:
                 if data is not None:
@@ -1120,7 +1119,7 @@ class MixABTestGPU:
                     t["audio_peak"]  = audio_peak
                     self._recalc_audio_gains()
                     _log(f"  engine active={self._engine._active} playing={self._engine._playing} buffers={list(self._engine._buffers.keys())}")
-                    self._inc_processing("LUFS")
+                    self._inc_processing()   # LUFS
                     self._decode_executor.submit(self._lufs_thread, track_id, data)
                 break
 
@@ -1132,10 +1131,10 @@ class MixABTestGPU:
             integrated, curve = audio_ops.analyze_loudness(ds, sr=16000)
             self._post(self._on_lufs_done, track_id, integrated, curve)
         except Exception:
-            self._post(self._dec_processing, "LUFS")
+            self._post(self._dec_processing)   # LUFS error
 
     def _on_lufs_done(self, track_id: int, integrated: float, curve) -> None:
-        self._dec_processing("LUFS")
+        self._dec_processing()   # LUFS done
         for idx, t in enumerate(self._tracks):
             if t["id"] == track_id:
                 t["lufs"]       = integrated
@@ -1152,11 +1151,10 @@ class MixABTestGPU:
         except Exception:
             import traceback
             self._post(_log, f"_wave_thread EXCEPTION idx={idx}: {traceback.format_exc()}")
-            self._post(self._dec_processing, "waveform")
 
     def _on_wave_done(self, idx: int, path: str, samples: tuple, peak: int) -> None:
         _log(f"_on_wave_done idx={idx} samples={len(samples)} tex={self._slot_textures[idx] is not None}")
-        self._dec_processing("waveform")
+        self._dec_processing()   # waveform done
         if idx >= len(self._tracks) or self._tracks[idx]["path"] != path:
             _log(f"  -> stale, skip")
             return
@@ -1175,7 +1173,7 @@ class MixABTestGPU:
         # Samples are already available and the display geometry is stable.
         wave_w = max(1, self._track_area_w - METER_W)
         slot_h = max(1, (self._track_area_h - _TRACK_PAD * (MAX_TRACKS - 1)) // MAX_TRACKS)
-        self._inc_processing("FFT")
+        self._inc_processing()   # spectrogram
         threading.Thread(
             target=self._spectro_thread,
             args=(idx, path, wave_w, slot_h),
@@ -1192,7 +1190,7 @@ class MixABTestGPU:
             sr          = decode_sample_rate(info["sample_rate"])
             audio       = audio_ops.decode_audio(path, samplerate=sr, channels=1)
             if audio is None:
-                self._post(self._dec_processing, "FFT")
+                self._post(self._dec_processing)
                 return
             n_samp = audio.shape[0]
             n_cols = n_cols_for_samples(n_samp, wave_w)
@@ -1201,10 +1199,10 @@ class MixABTestGPU:
         except Exception:
             import traceback
             self._post(_log, f"_spectro_thread EXCEPTION idx={idx}: {traceback.format_exc()}")
-            self._post(self._dec_processing, "FFT")
+            self._post(self._dec_processing)
 
     def _on_spectro_done(self, idx: int, path: str, rgba) -> None:
-        self._dec_processing("FFT")
+        self._dec_processing()   # spectrogram done
         if idx >= len(self._tracks) or self._tracks[idx]["path"] != path:
             return   # stale
         self._tracks[idx]["spectro_rgba"] = rgba   # cache for slot display
@@ -1223,7 +1221,7 @@ class MixABTestGPU:
             sr          = decode_sample_rate(info["sample_rate"])
             audio       = audio_ops.decode_audio(path, samplerate=sr, channels=1)
             if audio is None:
-                self._post(self._dec_processing, "FFT")
+                self._post(self._dec_processing)
                 return
             n_samp = audio.shape[0]
             n_cols = n_cols_for_samples(n_samp, wave_w)
@@ -1232,10 +1230,10 @@ class MixABTestGPU:
         except Exception:
             import traceback
             self._post(_log, f"_spectro_fs_thread EXCEPTION idx={idx}: {traceback.format_exc()}")
-            self._post(self._dec_processing, "FFT")
+            self._post(self._dec_processing)
 
     def _on_spectro_fs_done(self, idx: int, path: str, rgba) -> None:
-        self._dec_processing("FFT")
+        self._dec_processing()   # fullscreen spectrogram done
         if idx >= len(self._tracks) or self._tracks[idx]["path"] != path:
             return   # stale
         self._tracks[idx]["spectro_fs_rgba"] = rgba   # cache for fullscreen
@@ -1593,30 +1591,18 @@ class MixABTestGPU:
         if self._playing and pos >= max_dur - 0.05:
             self._on_playback_end_threadsafe()
 
-    def _inc_processing(self, name: str = "") -> None:
+    def _inc_processing(self) -> None:
         """Call from main thread when a background task starts."""
-        self._processing_tasks[name] = self._processing_tasks.get(name, 0) + 1
-        self._refresh_processing_lbl()
+        self._processing_count += 1
+        if dpg.does_item_exist(self._tag_processing_lbl):
+            dpg.configure_item(self._tag_processing_lbl, show=True)
 
-    def _dec_processing(self, name: str = "") -> None:
+    def _dec_processing(self) -> None:
         """Call from main thread when a background task completes (success or error)."""
-        if name in self._processing_tasks:
-            self._processing_tasks[name] -= 1
-            if self._processing_tasks[name] <= 0:
-                del self._processing_tasks[name]
-        self._refresh_processing_lbl()
-
-    def _refresh_processing_lbl(self) -> None:
-        if not dpg.does_item_exist(self._tag_processing_lbl):
-            return
-        active = [n for n in self._processing_tasks if self._processing_tasks[n] > 0 and n]
-        if active:
-            names = ", ".join(active)
-            dpg.configure_item(self._tag_processing_lbl,
-                               default_value=f"Processing ({names}), please wait..",
-                               show=True)
-        else:
-            dpg.configure_item(self._tag_processing_lbl, show=False)
+        self._processing_count = max(0, self._processing_count - 1)
+        if self._processing_count == 0:
+            if dpg.does_item_exist(self._tag_processing_lbl):
+                dpg.configure_item(self._tag_processing_lbl, show=False)
 
     def _update_ctrl_spacer(self) -> None:
         """Size the two half-spacers so right-side items hug the right edge
@@ -1645,7 +1631,7 @@ class MixABTestGPU:
             # When the label is visible, measure its rendered width and keep it centred.
             # When hidden its width is 0 so we split the space evenly.
             lbl_w = 0
-            if (self._processing_tasks
+            if (self._processing_count > 0
                     and dpg.does_item_exist(self._tag_processing_lbl)):
                 try:
                     sz    = dpg.get_item_rect_size(self._tag_processing_lbl)
@@ -1764,7 +1750,7 @@ class MixABTestGPU:
                            default_value="Computing...", color=list(_DIM_FG))
         path_ref  = self._tracks[0]["path"]
         path_cand = self._tracks[cand_idx]["path"]
-        self._inc_processing("null test")
+        self._inc_processing()   # null test
         threading.Thread(
             target=self._null_thread,
             args=(cand_idx, path_ref, path_cand),
@@ -1779,7 +1765,7 @@ class MixABTestGPU:
             self._post(self._null_done_error, str(exc))
 
     def _null_done(self, cand_idx: int, metrics: dict, null_f32) -> None:
-        self._dec_processing("null test")
+        self._dec_processing()   # null test done
         self._null_running = False
         dpg.configure_item(self._tag_null_toggle, enabled=True)
         self._null_results[cand_idx] = metrics
@@ -1794,7 +1780,6 @@ class MixABTestGPU:
         self._activate_null_playback(cand_idx)
 
     def _null_done_error(self, message: str) -> None:
-        self._dec_processing("null test")
         self._null_running = False
         dpg.configure_item(self._tag_null_toggle, enabled=True)
         dpg.configure_item(self._tag_null_status,
@@ -1933,7 +1918,6 @@ class MixABTestGPU:
                 if t.get("wave_raw"):
                     wave_w = max(1, self._track_area_w - METER_W)
                     vh     = self._track_area_h
-                    self._inc_processing("FFT")
                     threading.Thread(
                         target=self._spectro_fs_thread,
                         args=(idx, t["path"], wave_w, vh),
@@ -2258,7 +2242,6 @@ class MixABTestGPU:
         if self._active < len(self._tracks):
             t = self._tracks[self._active]
             if t.get("wave_raw"):
-                self._inc_processing()   # fullscreen spectrogram
                 threading.Thread(
                     target=self._spectro_fs_thread,
                     args=(self._active, t["path"], wave_w, vh),
