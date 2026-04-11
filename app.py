@@ -90,6 +90,34 @@ _CTRL_H     = 44    # control bar height in pixels
 _MENU_H     = 26    # menu bar height in pixels
 _TRACK_PAD  = 2     # gap between track rows in pixels
 
+# ── Musical note frequency table (from research/frequencies_to_musical_notes.csv) ──
+# Rows: C C# D D# E F F# G G# A A# B  (12 notes)
+# Columns: octaves 0–8
+_NOTE_TABLE = [
+    ("C",  [16.35, 32.70,  65.41,  130.81,  261.63,  523.25, 1046.50, 2093.00, 4186.01]),
+    ("C#", [17.32, 34.65,  69.30,  138.59,  277.18,  554.37, 1108.73, 2217.46, 4434.92]),
+    ("D",  [18.35, 36.71,  73.42,  146.83,  293.66,  587.33, 1174.66, 2349.32, 4698.63]),
+    ("D#", [19.45, 38.89,  77.78,  155.56,  311.13,  622.25, 1244.51, 2489.02, 4978.03]),
+    ("E",  [20.60, 41.20,  82.41,  164.81,  329.63,  659.25, 1318.51, 2637.02, 5274.04]),
+    ("F",  [21.83, 43.65,  87.31,  174.61,  349.23,  698.46, 1396.91, 2793.83, 5587.65]),
+    ("F#", [23.12, 46.25,  92.50,  185.00,  369.99,  739.99, 1479.98, 2959.96, 5919.91]),
+    ("G",  [24.50, 49.00,  98.00,  196.00,  392.00,  783.99, 1567.98, 3135.96, 6271.93]),
+    ("G#", [25.96, 51.91, 103.83,  207.65,  415.30,  830.61, 1661.22, 3322.44, 6644.88]),
+    ("A",  [27.50, 55.00, 110.00,  220.00,  440.00,  880.00, 1760.00, 3520.00, 7040.00]),
+    ("A#", [29.14, 58.27, 116.54,  233.08,  466.16,  932.33, 1864.66, 3729.31, 7458.62]),
+    ("B",  [30.87, 61.74, 123.47,  246.94,  493.88,  987.77, 1975.53, 3951.07, 7902.13]),
+]
+# Flat sorted list of (label, hz) within the 20–20000 Hz display range
+_NOTE_LABELS: list[tuple[str, float]] = []
+for _note, _freqs in _NOTE_TABLE:
+    for _oct, _hz in enumerate(_freqs):
+        if 20.0 <= _hz <= 20000.0:
+            _NOTE_LABELS.append((f"{_note}{_oct}", _hz))
+_NOTE_LABELS.sort(key=lambda x: x[1])   # ascending Hz (bottom→top on display)
+
+_NOTE_LABEL_W    = 44   # px reserved for note labels on the left of the fullscreen view
+_NOTE_MIN_SPACING = 9   # minimum px between consecutive drawn labels (size=9 font ≈ 9px tall)
+
 
 def _hex_to_dpg_rgba(hex_color: str, alpha: int = 255) -> tuple:
     h = hex_color.lstrip("#")
@@ -584,6 +612,8 @@ class MixABTestGPU:
 
         for i in range(MAX_TRACKS):
             self._build_slot_window(i, vw, slot_h)
+            if i < len(self._tracks):
+                self._tracks[i]["slot_h"] = slot_h
 
         self._update_dim_rects()
         self._refresh_placeholder()
@@ -913,7 +943,12 @@ class MixABTestGPU:
                 label=f"{chk if self._spectrogram_fullscreen else dot}Spectrogram fill window",
                 callback=self._toggle_spectrogram_fullscreen,
             )
-            with dpg.menu(label=f"Spectrogram speed  ({self._spectrogram_zoom:.0f}x)"):
+            with dpg.menu(label=f"Spectrogram speed  ({'Full' if self._spectrogram_zoom == 0.0 else f'{self._spectrogram_zoom:.0f}x'})"):
+                dpg.add_menu_item(
+                    label=f"{'> ' if self._spectrogram_zoom == 0.0 else '  '}Full track",
+                    callback=lambda s, a, u: self._set_spectrogram_zoom(u),
+                    user_data=0.0,
+                )
                 for z in (1, 2, 4):
                     dpg.add_menu_item(
                         label=f"{'> ' if z == self._spectrogram_zoom else '  '}{z}x",
@@ -1213,6 +1248,20 @@ class MixABTestGPU:
         sg = self._slot_spectrograms[idx] if idx < len(self._slot_spectrograms) else None
         if sg:
             sg.set_data(rgba)
+            # set_data() appended draw_image items to slot_dl — they now sit on top
+            # of the play line that was drawn during build.  Re-create the play line
+            # at the end of slot_dl so it's always the last (topmost) item.
+            dl_tag   = f"slot_dl_{idx}"
+            line_tag = f"slot_play_line_{idx}"
+            if dpg.does_item_exist(dl_tag):
+                if dpg.does_item_exist(line_tag):
+                    dpg.delete_item(line_tag)
+                slot_h = self._tracks[idx].get("slot_h", 80)
+                dpg.draw_line(
+                    (0, 0), (0, slot_h),
+                    color=(255, 255, 255, 220), thickness=2,
+                    tag=line_tag, parent=dl_tag,
+                )
 
     def _spectro_fs_thread(self, idx: int, path: str,
                            wave_w: int, vh: int) -> None:
@@ -1243,6 +1292,7 @@ class MixABTestGPU:
         self._tracks[idx]["spectro_fs_rgba"] = rgba   # cache for fullscreen
         if self._spectrogram_fullscreen and self._fs_strip and idx == self._active:
             self._fs_strip.set_data(rgba)
+            self._draw_fs_note_labels()
 
     def _draw_lufs_overlay(self, idx: int, generation: int = -1) -> None:
         """Draw (or redraw) LUFS curve polyline and score label for slot idx."""
@@ -1513,8 +1563,15 @@ class MixABTestGPU:
 
             line_tag = f"slot_play_line_{idx}"
             if play_px >= 0 and dpg.does_item_exist(line_tag):
-                # Spectrogram scroll: "now" is always at the right edge of the display
-                line_x = wave_w if (self._spectrogram_enabled and sg) else play_px
+                if self._spectrogram_enabled and sg:
+                    if self._spectrogram_zoom == 0.0:
+                        # Full-track mode: playhead travels left→right proportionally
+                        line_x = int(frac * wave_w)
+                    else:
+                        # Scroll mode: "now" is always pinned at the right edge
+                        line_x = wave_w
+                else:
+                    line_x = play_px
                 dpg.configure_item(line_tag, p1=(line_x, 0), p2=(line_x, slot_h))
 
         # Null slot waveform: UV split + playhead line
@@ -2260,7 +2317,7 @@ class MixABTestGPU:
         if self._active < len(self._tracks):
             t = self._tracks[self._active]
             if t.get("wave_raw"):
-                self._inc_processing()   # fullscreen spectrogram
+                self._inc_processing("FFT")
                 threading.Thread(
                     target=self._spectro_fs_thread,
                     args=(self._active, t["path"], wave_w, vh),
@@ -2283,6 +2340,40 @@ class MixABTestGPU:
             color=(180, 180, 180, 200),
             tag="fs_close_label", parent=dl,
         )
+
+    def _draw_fs_note_labels(self) -> None:
+        """Draw note frequency labels into fs_spectro_dl AFTER set_data() fires.
+
+        set_data() appends draw_image items to fs_spectro_dl.  Drawing the labels
+        after that call means they are the last items in the drawlist — always on top.
+        Calling this again (on track switch) deletes old label items via tag and
+        re-adds them at the end.
+        """
+        if not dpg.does_item_exist("fs_spectro_dl"):
+            return
+        dl = "fs_spectro_dl"
+        # Delete previous label items if they exist (track switch / rebuild)
+        if dpg.does_item_exist("fs_note_labels_group"):
+            dpg.delete_item("fs_note_labels_group")
+        vh = self._track_area_h
+        grp = dpg.add_draw_node(tag="fs_note_labels_group", parent=dl)
+        log_range = math.log(20000.0 / 20.0)
+        last_y = -_NOTE_MIN_SPACING - 1
+        for label, hz in reversed(_NOTE_LABELS):
+            y = round(math.log(20000.0 / hz) / log_range * (vh - 1))
+            if y - last_y < _NOTE_MIN_SPACING:
+                continue
+            last_y = y
+            dpg.draw_text(
+                (3, y - 4), label, size=9,
+                color=(210, 210, 210, 210),
+                parent=grp,
+            )
+            dpg.draw_line(
+                (36, y), (54, y),
+                color=(220, 220, 220, 220), thickness=1,
+                parent=grp,
+            )
 
     def _destroy_fullscreen_spectrogram(self) -> None:
         """Tear down the fullscreen floating window and its strip."""
@@ -2382,6 +2473,10 @@ class MixABTestGPU:
         for sg in self._slot_spectrograms:
             if sg:
                 sg.set_zoom(factor)
+                # In full-track mode the UV layout is static — paint it immediately
+                # so it doesn't wait for the next set_scroll() call in _tick().
+                if factor == 0.0:
+                    sg.set_scroll(0.0)
         if self._fs_strip:
             self._fs_strip.set_zoom(factor)
 

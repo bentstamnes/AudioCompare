@@ -142,10 +142,14 @@ Deleted DPG items free C++ pointers. Calling `set_value` on a freed tag causes a
 
 **Correct item order in `_build_slot_window`:**
 1. Invisible click button at `pos=(0,0)` — bottom Z, receives clicks
-2. `slot_dl` drawlist (waveform + meter items at `x_offset=wave_w`)
-3. Spectrum drawlist at `pos=(0,1)` — must be added here while cursor is at y≈0
-4. Name text at `pos=(8,4)`
-5. X remove hint drawn into `slot_dl`
+2. `slot_dl` drawlist — waveform images, dim rect, meter strip, corr bar, spectrum overlay, spectrogram strip, play line, "x" hint
+3. Name text at `pos=(8,4)`
+
+**Do NOT add a second sibling drawlist in slot child windows.** DPG flow layout in `child_window` pushes a second drawlist below the first even with `pos=(0,1)` — the slot goes entirely black. Keep a single `slot_dl`.
+
+**Z-order for async spectrogram tiles:** `SpectrogramStrip.set_data()` appends `draw_image` items after build time, burying the play line. Fix: in `_on_spectro_done`, delete `slot_play_line_{idx}` and re-create it at the tail of `slot_dl_{idx}`. One-time cost per track load.
+
+**Two sibling drawlists DO work in top-level floating windows** (not child windows). `fs_spectro_win` uses this: `fs_spectro_dl` for tiles, `fs_note_dl` added after for note labels. Sibling insertion order controls z in floating windows. Use `add_draw_node(tag=...)` to group overlay items for clean delete+re-add after `set_data()`.
 
 ### Theme inheritance — bind to items, not containers
 

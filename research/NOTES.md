@@ -75,6 +75,21 @@ mask = mag > (mag.max(axis=1, keepdims=True) * 0.01)
 
 ---
 
+## Drawlist z-order with async set_data (2026-04-12)
+
+`SpectrogramStrip.set_data()` runs from a background thread callback (`_on_spectro_fs_done`),
+which is always *after* `_build_fullscreen_spectrogram` has finished.  It appends
+`draw_image` items to the drawlist — they are inserted last and therefore render on top
+of anything drawn during build time.
+
+**Rule:** Never draw persistent overlays (note labels, tick marks, etc.) into
+`fs_spectro_dl` inside `_build_fullscreen_spectrogram`.  Instead put them in a helper
+method (e.g. `_draw_fs_note_labels()`) called from `_on_spectro_fs_done` immediately
+after `self._fs_strip.set_data(rgba)`.  Group overlay items under `add_draw_node(tag=...)`
+so the whole group can be deleted and re-added cleanly on track switch.
+
+---
+
 ## Short layer (standard FFT onset) — disabled (2026-04-12)
 
 The short 1024-FFT onset layer was originally added to boost transient/kick visibility.
