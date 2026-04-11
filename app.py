@@ -151,6 +151,7 @@ class MixABTestGPU:
         self._spectrum_enabled      = True
         self._spectrogram_enabled      = False
         self._spectrogram_fullscreen   = False
+        self._spectrogram_zoom         = 1.5   # time-axis zoom; 1=natural density, higher=fewer seconds visible
         self._fs_strip: Optional[SpectrogramStrip] = None   # fullscreen strip
         self._fft_size        = _FFT_SIZE_DEFAULT
         self._fft_bands       = _FFT_BANDS_DEFAULT
@@ -579,9 +580,25 @@ class MixABTestGPU:
         # _on_wave_done callbacks if multiple tracks are added in the same tick
         # (e.g. drag-drop 4 files at once).  Re-applying here ensures those tracks
         # don't end up with blank textures.
+        wave_w = max(1, vw - METER_W)
         for i, t in enumerate(self._tracks):
             if t.get("wave_raw") and self._slot_textures[i]:
                 self._refresh_track_waveform(i)
+            # Re-seed spectrogram texture from cached rgba (if already computed).
+            # The new SpectrogramStrip has a blank placeholder — set_data() restores it.
+            # If the display width changed, also re-launch compute at the new n_cols.
+            sg   = self._slot_spectrograms[i]
+            rgba = t.get("spectro_rgba")
+            if sg and rgba is not None:
+                # Always show cached data immediately — no blank gap on resize.
+                # If the display width changed, also recompute at the new wave_w.
+                sg.set_data(rgba)
+                if rgba.shape[1] != max(wave_w, min(6000, rgba.shape[1])):
+                    threading.Thread(
+                        target=self._spectro_thread,
+                        args=(i, t["path"], wave_w, slot_h),
+                        daemon=True,
+                    ).start()
 
         # If fullscreen spectrogram is active, rebuild the floating window at new size
         if self._spectrogram_fullscreen:
@@ -696,6 +713,7 @@ class MixABTestGPU:
         # 3. Spectrum bars — always created; toggled via set_visible so switching
         #    never requires a slot rebuild (same pattern as MeterStrip).
         spec = SpectrumOverlay(
+            texture_registry=self._tex_reg,
             drawlist_tag=dl,
             x_offset=0,
             width=wave_w,
@@ -716,6 +734,7 @@ class MixABTestGPU:
             active_color=colors[1],
         )
         sgram.set_visible(self._spectrogram_enabled)
+        sgram.set_zoom(self._spectrogram_zoom)
         self._slot_spectrograms[idx] = sgram
 
         # 4. Track name label (on top of waveform) — bold if font available
@@ -880,6 +899,13 @@ class MixABTestGPU:
                 label=f"{chk if self._spectrogram_fullscreen else dot}Spectrogram fill window",
                 callback=self._toggle_spectrogram_fullscreen,
             )
+            with dpg.menu(label=f"Spectrogram speed  ({self._spectrogram_zoom:.0f}x)"):
+                for z in (1, 2, 4, 6, 8, 12):
+                    dpg.add_menu_item(
+                        label=f"{'> ' if z == self._spectrogram_zoom else '  '}{z}x",
+                        callback=lambda s, a, u: self._set_spectrogram_zoom(u),
+                        user_data=float(z),
+                    )
             with dpg.menu(label="FFT size"):
                 for sz in (512, 1024, 2048, 4096):
                     dpg.add_menu_item(
@@ -1124,6 +1150,70 @@ class MixABTestGPU:
                 self._refresh_track_waveform(i)
         else:
             self._refresh_track_waveform(idx)
+
+        # Launch static spectrogram computation in a background thread.
+        # Samples are already available and the display geometry is stable.
+        wave_w = max(1, self._track_area_w - METER_W)
+        slot_h = max(1, (self._track_area_h - _TRACK_PAD * (MAX_TRACKS - 1)) // MAX_TRACKS)
+        threading.Thread(
+            target=self._spectro_thread,
+            args=(idx, path, wave_w, slot_h),
+            daemon=True,
+        ).start()
+
+    def _spectro_thread(self, idx: int, path: str,
+                        wave_w: int, slot_h: int) -> None:
+        try:
+            from renderers.spectrogram import (
+                compute_static, n_cols_for_samples, decode_sample_rate,
+            )
+            info        = audio_ops.probe_info(path)
+            sr          = decode_sample_rate(info["sample_rate"])
+            audio       = audio_ops.decode_audio(path, samplerate=sr, channels=1)
+            if audio is None:
+                return
+            n_samp = audio.shape[0]
+            n_cols = n_cols_for_samples(n_samp, wave_w)
+            rgba   = compute_static(audio, n_cols, slot_h, sr)
+            self._post(self._on_spectro_done, idx, path, rgba)
+        except Exception:
+            import traceback
+            self._post(_log, f"_spectro_thread EXCEPTION idx={idx}: {traceback.format_exc()}")
+
+    def _on_spectro_done(self, idx: int, path: str, rgba) -> None:
+        if idx >= len(self._tracks) or self._tracks[idx]["path"] != path:
+            return   # stale
+        self._tracks[idx]["spectro_rgba"] = rgba   # cache for slot display
+        sg = self._slot_spectrograms[idx] if idx < len(self._slot_spectrograms) else None
+        if sg:
+            sg.set_data(rgba)
+
+    def _spectro_fs_thread(self, idx: int, path: str,
+                           wave_w: int, vh: int) -> None:
+        """Compute fullscreen spectrogram at the viewport's full height."""
+        try:
+            from renderers.spectrogram import (
+                compute_static, n_cols_for_samples, decode_sample_rate,
+            )
+            info        = audio_ops.probe_info(path)
+            sr          = decode_sample_rate(info["sample_rate"])
+            audio       = audio_ops.decode_audio(path, samplerate=sr, channels=1)
+            if audio is None:
+                return
+            n_samp = audio.shape[0]
+            n_cols = n_cols_for_samples(n_samp, wave_w)
+            rgba   = compute_static(audio, n_cols, vh, sr)
+            self._post(self._on_spectro_fs_done, idx, path, rgba)
+        except Exception:
+            import traceback
+            self._post(_log, f"_spectro_fs_thread EXCEPTION idx={idx}: {traceback.format_exc()}")
+
+    def _on_spectro_fs_done(self, idx: int, path: str, rgba) -> None:
+        if idx >= len(self._tracks) or self._tracks[idx]["path"] != path:
+            return   # stale
+        self._tracks[idx]["spectro_fs_rgba"] = rgba   # cache for fullscreen
+        if self._spectrogram_fullscreen and self._fs_strip and idx == self._active:
+            self._fs_strip.set_data(rgba)
 
     def _draw_lufs_overlay(self, idx: int, generation: int = -1) -> None:
         """Draw (or redraw) LUFS curve polyline and score label for slot idx."""
@@ -1387,9 +1477,16 @@ class MixABTestGPU:
                                        pmin=(0, 0), pmax=(wave_w, slot_h),
                                        uv_min=(0, 0), uv_max=(1, 1))
 
+            # Spectrogram UV scroll — playhead pinned at right edge
+            sg = self._slot_spectrograms[idx] if idx < len(self._slot_spectrograms) else None
+            if sg and self._spectrogram_enabled:
+                sg.set_scroll(frac)
+
             line_tag = f"slot_play_line_{idx}"
             if play_px >= 0 and dpg.does_item_exist(line_tag):
-                dpg.configure_item(line_tag, p1=(play_px, 0), p2=(play_px, slot_h))
+                # Spectrogram scroll: "now" is always at the right edge of the display
+                line_x = wave_w if (self._spectrogram_enabled and sg) else play_px
+                dpg.configure_item(line_tag, p1=(line_x, 0), p2=(line_x, slot_h))
 
         # Null slot waveform: UV split + playhead line
         if self._null_mode and self._null_tex and self._null_wave_raw:
@@ -1445,14 +1542,15 @@ class MixABTestGPU:
                 bar.update(corr, self._playing)
         self._perf.end_section("meters")
 
-        # Fullscreen spectrogram playhead
-        if self._spectrogram_fullscreen and dpg.does_item_exist("fs_play_line"):
+        # Fullscreen spectrogram: UV scroll + playhead at right edge
+        if self._spectrogram_fullscreen:
             wave_w = max(1, self._track_area_w - METER_W)
-            play_px = int(wave_w * frac) if max_dur > 0 else -1
-            if play_px >= 0:
+            if self._fs_strip:
+                self._fs_strip.set_scroll(frac)
+            if dpg.does_item_exist("fs_play_line"):
                 dpg.configure_item("fs_play_line",
-                                   p1=(play_px, 0),
-                                   p2=(play_px, self._track_area_h))
+                                   p1=(wave_w, 0),
+                                   p2=(wave_w, self._track_area_h))
 
         # Spectrum / spectrogram (every other frame to save CPU)
         self._perf.begin_section("spectrum_dispatch")
@@ -1522,16 +1620,19 @@ class MixABTestGPU:
 
     def _spectrum_thread(self, track_ids, active_id) -> None:
         try:
-            spectra   = self._engine.sample_spectrum(track_ids)
-            hires     = self._engine.sample_spectrum_hires(track_ids) if self._spectrogram_enabled else {}
-            fs_raw    = self._engine.sample_spectrum_fullscreen(track_ids) if self._spectrogram_fullscreen else {}
-            self._post(self._apply_spectrum, spectra, hires, fs_raw, active_id)
+            spectra = self._engine.sample_spectrum(track_ids)
+            self._post(self._apply_spectrum, spectra, active_id)
         except Exception:
             import traceback
             self._post(_log, f"_spectrum_thread EXCEPTION: {traceback.format_exc()}")
             self._spectrum_pending = False
 
-    def _apply_spectrum(self, spectra: dict, hires: dict, fs_raw: dict, active_id) -> None:
+    def _apply_spectrum(self, spectra: dict, active_id) -> None:
+        """Update real-time spectrum bar overlays only.
+
+        Spectrogram textures are pre-computed at load time and never updated
+        per-frame — they are static textures, same pattern as the waveform.
+        """
         try:
             n_bands = self._fft_bands
             for idx, t in enumerate(self._tracks):
@@ -1549,18 +1650,6 @@ class MixABTestGPU:
                 sg = self._slot_spectrograms[idx]
                 if sg:
                     sg.set_visible(not hide and self._spectrogram_enabled)
-                    if not hide and self._spectrogram_enabled:
-                        sg.set_active(is_active)
-                        if self._playing:
-                            sg.update(hires.get(tid), 512)
-
-            # Fullscreen strip — raw reassigned bins, one per pixel row
-            if self._spectrogram_fullscreen and self._fs_strip and self._playing:
-                active_tid = None
-                if self._tracks and self._active < len(self._tracks):
-                    active_tid = self._tracks[self._active]["id"]
-                if active_tid is not None:
-                    self._fs_strip.update(fs_raw.get(active_tid), 0, raw_bins=True)
         finally:
             self._spectrum_pending = False
 
@@ -1781,10 +1870,18 @@ class MixABTestGPU:
         self._update_dim_rects()
         if self._spectrogram_fullscreen:
             self._update_fullscreen_track_name()
-            # Clear the strip so the new track starts fresh
-            if self._fs_strip:
-                self._fs_strip.set_visible(False)
-                self._fs_strip.set_visible(True)
+            # Recompute the fullscreen spectrogram at viewport height for the new track.
+            # spectro_rgba is slot-height — passing it to _fs_strip would crash (size mismatch).
+            if self._fs_strip and idx < len(self._tracks):
+                t = self._tracks[idx]
+                if t.get("wave_raw"):
+                    wave_w = max(1, self._track_area_w - METER_W)
+                    vh     = self._track_area_h
+                    threading.Thread(
+                        target=self._spectro_fs_thread,
+                        args=(idx, t["path"], wave_w, vh),
+                        daemon=True,
+                    ).start()
         if self._null_mode:
             self._update_null_status()
 
@@ -2007,6 +2104,27 @@ class MixABTestGPU:
                 sg.set_visible(self._spectrogram_enabled and not self._spectrogram_fullscreen)
         self._update_dim_rects()
 
+        # If spectrogram was just turned on, trigger computation for any tracks
+        # whose spectrogram hasn't been computed yet (e.g. loaded before enabling).
+        if self._spectrogram_enabled and not was_spectrogram:
+            self._ensure_spectrograms_computed()
+
+    def _ensure_spectrograms_computed(self) -> None:
+        """Launch spectrogram computation for any loaded tracks that don't have it yet.
+
+        Called when spectrogram mode is first enabled so tracks loaded while the
+        spectrogram was off still get their textures computed.
+        """
+        wave_w = max(1, self._track_area_w - METER_W)
+        slot_h = max(1, (self._track_area_h - _TRACK_PAD * (MAX_TRACKS - 1)) // MAX_TRACKS)
+        for idx, t in enumerate(self._tracks):
+            if t.get("spectro_rgba") is None and t.get("wave_raw"):
+                threading.Thread(
+                    target=self._spectro_thread,
+                    args=(idx, t["path"], wave_w, slot_h),
+                    daemon=True,
+                ).start()
+
     def _build_fullscreen_spectrogram(self) -> None:
         """Create the fullscreen SpectrogramStrip in a floating DPG window.
 
@@ -2075,14 +2193,19 @@ class MixABTestGPU:
             scroll_step=2,
         )
         self._fs_strip.set_visible(True)
-        self._fs_strip.set_active(True)
+        self._fs_strip.set_zoom(self._spectrogram_zoom)
 
-        # Seed fullscreen buffer from the active slot strip so it doesn't
-        # start blank — the existing scrolled content carries over.
-        slot_sg = (self._slot_spectrograms[self._active]
-                   if self._active < len(self._slot_spectrograms) else None)
-        if slot_sg is not None:
-            self._fs_strip.seed_from_buffer(slot_sg.get_buffer())
+        # Launch fullscreen-height spectrogram computation for the active track.
+        # The slot rgba is the wrong height (slot_h vs vh) — passing it to set_data
+        # would create a mismatched texture and crash.  Always compute at vh.
+        if self._active < len(self._tracks):
+            t = self._tracks[self._active]
+            if t.get("wave_raw"):
+                threading.Thread(
+                    target=self._spectro_fs_thread,
+                    args=(self._active, t["path"], wave_w, vh),
+                    daemon=True,
+                ).start()
 
         # Playhead line — on top of spectrogram
         dpg.draw_line(
@@ -2193,6 +2316,14 @@ class MixABTestGPU:
         for ov in self._slot_spectra:
             if ov:
                 ov.reset_smooth()
+
+    def _set_spectrogram_zoom(self, factor: float) -> None:
+        self._spectrogram_zoom = factor
+        for sg in self._slot_spectrograms:
+            if sg:
+                sg.set_zoom(factor)
+        if self._fs_strip:
+            self._fs_strip.set_zoom(factor)
 
     def _toggle_wave_normalize(self) -> None:
         self._wave_normalize = not self._wave_normalize

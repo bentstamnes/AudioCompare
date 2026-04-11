@@ -5,17 +5,19 @@ Designed to be run by Claude Code via Bash to get before/after numbers.
 Prints the full analysis table to stdout, saves CSV to logs/.
 
 Usage:
-    python _test_perf.py                            # default window size, 4 test tracks
-    python _test_perf.py --width 2560 --height 1440 # stress-test at 2K
-    python _test_perf.py --no-files                 # baseline: no tracks loaded
-    python _test_perf.py --label "before dirty-fix" # adds label to output header
+    python _test_perf.py                               # default window size, 4 test tracks
+    python _test_perf.py --width 2560 --height 1440    # stress-test at 2K
+    python _test_perf.py --no-files                    # baseline: no tracks loaded
+    python _test_perf.py --tracks 1                    # load only 1 test track
+    python _test_perf.py --spectrogram-fs              # enable fullscreen spectrogram mode
+    python _test_perf.py --label "before dirty-fix"    # adds label to output header
 
 Exit code: 0 = ok, 1 = failed / no CSV written.
 
 Frame schedule:
-    0  - 179  : warmup — files loading, decoding, first render
-    180 - 1379 : MEASURE (20s at 60fps) — perf logged, playback running
-    1380+      : flush, analyze, exit
+    0  - 359  : warmup — files loading, decoding, first render (6s for 4 serial decodes)
+    360 - 1559 : MEASURE (20s at 60fps) — perf logged, playback running
+    1560+      : flush, analyze, exit
 """
 
 from __future__ import annotations
@@ -39,17 +41,19 @@ _TESTFILES  = [
     os.path.join(_HERE, "testfiles", "Pex L - Only You.mp3"),
 ]
 
-WARMUP_FRAMES   = 180   # 3 s at 60 fps — files load + decode
+WARMUP_FRAMES   = 360   # 6 s at 60 fps — files load + decode (4 serial decodes ~1s each)
 MEASURE_FRAMES  = 1200  # 20 s of measurement
 EXIT_FRAME      = WARMUP_FRAMES + MEASURE_FRAMES + 60
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="MixABTestGPU perf benchmark")
-    p.add_argument("--width",    type=int, default=0, help="Viewport width  (0 = use saved prefs)")
-    p.add_argument("--height",   type=int, default=0, help="Viewport height (0 = use saved prefs)")
-    p.add_argument("--no-files", action="store_true",  help="Don't load test files (pure overhead baseline)")
-    p.add_argument("--label",    type=str, default="",  help="Free-text label printed in header")
+    p.add_argument("--width",          type=int, default=0,     help="Viewport width  (0 = use saved prefs)")
+    p.add_argument("--height",         type=int, default=0,     help="Viewport height (0 = use saved prefs)")
+    p.add_argument("--no-files",       action="store_true",     help="Don't load test files (pure overhead baseline)")
+    p.add_argument("--tracks",         type=int, default=4,     help="Number of test tracks to load (1-4, default 4)")
+    p.add_argument("--spectrogram-fs", action="store_true",     help="Enable fullscreen spectrogram mode before measurement")
+    p.add_argument("--label",          type=str, default="",    help="Free-text label printed in header")
     return p.parse_args()
 
 
@@ -63,10 +67,11 @@ def main() -> int:
     app = MixABTestGPU()
 
     # ── Load test files via thread (same pattern as _test_launch.py) ─────────
+    n_tracks = max(1, min(4, args.tracks))
     if not args.no_files:
         def _load() -> None:
             time.sleep(1.0)   # wait for tick_ready / first frame
-            for f in _TESTFILES:
+            for f in _TESTFILES[:n_tracks]:
                 app._post(app._add_track, f)
                 time.sleep(0.1)
         threading.Thread(target=_load, daemon=True).start()
@@ -76,6 +81,7 @@ def main() -> int:
     resize_done    = False
     perf_started   = False
     perf_stopped   = False
+    sgfs_enabled   = False
     csv_path: str  = ""
 
     dpg.set_exit_callback(app._on_close)
@@ -95,6 +101,13 @@ def main() -> int:
             resize_done = True
             print(f"[frame {frame_count}] viewport -> {args.width}x{args.height}", flush=True)
 
+        # ── Enable fullscreen spectrogram once tracks are loaded ──────────────
+        # Fire at frame WARMUP-60 so it's fully active before measurement starts.
+        if args.spectrogram_fs and not sgfs_enabled and frame_count == WARMUP_FRAMES - 60:
+            app._post(app._toggle_spectrogram_fullscreen)
+            sgfs_enabled = True
+            print(f"[frame {frame_count}] spectrogram fullscreen enabled", flush=True)
+
         # ── Start perf + playback after warmup ────────────────────────────────
         if frame_count == WARMUP_FRAMES and not perf_started:
             perf_started = True
@@ -105,8 +118,9 @@ def main() -> int:
             csv_path = app._perf.enable(app._perf_log_dir)
             w = dpg.get_viewport_width()
             h = dpg.get_viewport_height()
+            fs_state = f"  spectrogram-fs={app._spectrogram_fullscreen}"
             print(f"[frame {frame_count}] perf logging started  "
-                  f"viewport={w}x{h}  tracks={len(app._tracks)}", flush=True)
+                  f"viewport={w}x{h}  tracks={len(app._tracks)}{fs_state}", flush=True)
 
         # ── Stop measurement ──────────────────────────────────────────────────
         if frame_count == WARMUP_FRAMES + MEASURE_FRAMES and not perf_stopped:

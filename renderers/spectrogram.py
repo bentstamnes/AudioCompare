@@ -1,58 +1,317 @@
 """
-renderers/spectrogram.py — Real-time scrolling spectrogram overlay.
+renderers/spectrogram.py — Pre-computed static spectrogram texture with UV scrolling.
 
-Draws a horizontal spectrogram directly into a parent DPG drawlist using a
-dynamic texture.  Each FFT update shifts the buffer one column left and writes
-the new frequency column on the right edge.
+Architecture:
 
-Frequency layout: low freq at bottom (y = height-1), high freq at top (y = 0).
-Color encodes amplitude via a fixed heat palette:
-  silence → black → dark purple → bright magenta → red → bright orange
-Mutually exclusive with SpectrumOverlay — only one is shown at a time.
+  OLD (real-time scrolling): add_dynamic_texture + scroll 57MB buffer + set_value
+       every tick = ~53ms per _apply_spectrum call → 31fps at 2K with 1 track.
+
+  NEW: Full-file spectrogram computed ONCE in a background thread at load time.
+       Stored as a DPG raw texture at up to _N_COLS_MAX columns.  During playback:
+       zero GPU upload — only uv_min/uv_max and pmin/pmax are updated via a single
+       configure_item call per frame per strip.
+
+  Why it looks like scrolling: the UV window is always wave_w texture-columns wide,
+  ending at the current playhead position.  As pos_norm advances, the window slides
+  right → the spectrogram scrolls left, playhead stays pinned to the right edge.
+
+  Early playback (<1 full window of audio played): the display is partly black on the
+  left and the spectrogram fills in from the right — identical to the old real-time
+  behaviour when the buffer hadn't filled yet.
+
+Frequency layout: low freq at bottom (row height-1), high freq at top (row 0).
+Color: fixed heat palette — silence→black → purple → magenta → orange.
 """
 
 from __future__ import annotations
 import numpy as np
 import dearpygui.dearpygui as dpg
 
-_SPECTRUM_DB_FLOOR = -70.0   # dBFS floor (matches spectrum.py)
-_SAMPLERATE        = 48000   # must match player.py SAMPLERATE
-_FS_FREQ_LO        = 30.0    # Hz — bottom of fullscreen display
-_FS_FREQ_HI        = 20000.0 # Hz — top of fullscreen display
+_SPECTRUM_DB_FLOOR = -70.0   # dBFS floor — also the colormap black point
+_FS_FREQ_LO        = 20.0    # Hz — bottom of display (sub-bass floor; ~E0 piano)
+_FS_FREQ_HI        = 20000.0 # Hz — top of display
+
+# FFT window size.  4096 @ 44100 Hz → 93 ms window, 10.7 Hz/bin.
+# Matches the reference app (FFT size 4096) for frequency resolution.
+_FFT_SIZE          = 4096
+
+# Hop between successive analysis windows.  25% overlap (FFT_SIZE//4) gives
+# 23 ms effective time resolution — a kick drum pitch sweep (~30 ms) now spans
+# 1–2 columns instead of collapsing into one.  50% overlap only gave 46 ms.
+_HOP_SIZE          = _FFT_SIZE // 4   # 25% overlap = 1024 samples @ 44100 Hz
+
+# Maximum decode sample rate for spectrogram computation.  Files above this
+# are decoded down to _SR_MAX; files below are decoded at their native rate.
+# 48000 Hz gives Nyquist = 24000 Hz, comfortably above _FS_FREQ_HI = 20000 Hz.
+_SR_MAX            = 48000
+
+# Maximum texture columns per strip.
+# Raised to 10 000 so a 4-min track at 44100 Hz (≈10 117 hops at hop=1024)
+# hits the cap and every column maps to exactly one hop (23 ms effective res).
+# Memory ceiling: 10 000 × height × 4ch × 4 bytes ≈ 53 MB/track (4 tracks ≈ 212 MB).
+_N_COLS_MAX        = 10000
 
 # ── Heat palette ─────────────────────────────────────────────────────────────
-# Control points: (amplitude_0_to_1, R, G, B) all in 0..1 range.
-# Inspired by classic spectrogram "fire" palettes.
 _PALETTE_STOPS = np.array([
-    [0.00,  0.00, 0.00, 0.00],   # black        — silence
-    [0.18,  0.12, 0.00, 0.22],   # dark purple
-    [0.38,  0.55, 0.00, 0.65],   # mid purple
-    [0.55,  0.85, 0.00, 0.75],   # bright magenta/pink
-    [0.70,  0.95, 0.05, 0.15],   # red-pink
-    [0.83,  1.00, 0.35, 0.00],   # orange-red
-    [0.93,  1.00, 0.70, 0.00],   # orange
-    [1.00,  1.00, 0.95, 0.40],   # bright yellow-orange — peak
+    [0.00,  0.00, 0.00, 0.00],
+    [0.18,  0.12, 0.00, 0.22],
+    [0.38,  0.55, 0.00, 0.65],
+    [0.55,  0.85, 0.00, 0.75],
+    [0.70,  0.95, 0.05, 0.15],
+    [0.83,  1.00, 0.35, 0.00],
+    [0.93,  1.00, 0.70, 0.00],
+    [1.00,  1.00, 0.95, 0.40],
 ], dtype=np.float32)
 
 
 def _build_lut(n: int = 256) -> np.ndarray:
-    """Return (n, 3) float32 RGB LUT, index 0 = silence, n-1 = peak."""
-    xs   = _PALETTE_STOPS[:, 0]
-    rgb  = _PALETTE_STOPS[:, 1:]
-    t    = np.linspace(0.0, 1.0, n, dtype=np.float32)
-    lut  = np.empty((n, 3), dtype=np.float32)
+    xs  = _PALETTE_STOPS[:, 0]
+    rgb = _PALETTE_STOPS[:, 1:]
+    t   = np.linspace(0.0, 1.0, n, dtype=np.float32)
+    lut = np.empty((n, 3), dtype=np.float32)
     for ch in range(3):
         lut[:, ch] = np.interp(t, xs, rgb[:, ch])
     return lut
 
 
-_LUT = _build_lut(256)   # module-level, built once
+_LUT      = _build_lut(256)
+_N_BINS   = _FFT_SIZE // 2 + 1
+# FFT normalization factor: for a 0 dBFS tone the peak rfft bin magnitude is
+# ≈ N/4 (Hann coherent gain 0.5 × N/2).  Dividing by this maps the result to
+# the 0..1 linear amplitude range so the _SPECTRUM_DB_FLOOR floor is meaningful.
+_FFT_NORM = float(_FFT_SIZE // 4)
+
+# Reassignment windows (computed once at import)
+_n_arr   = np.arange(_FFT_SIZE, dtype=np.float32)
+_HANN    = np.hanning(_FFT_SIZE).astype(np.float32)
+_HANN_DH = np.gradient(_HANN).astype(np.float32)       # d/dn of Hann — for IF estimate
+_HANN_TH = (_n_arr * _HANN).astype(np.float32)          # time-ramp × Hann — for GD estimate
+
+# ── Log-frequency axis constants ─────────────────────────────────────────────
+# Pure log scale: each octave gets equal vertical space.  With _FS_FREQ_LO=20 Hz
+# the 20-200 Hz decade occupies ~30 % of the display — much more than Mel which
+# is nearly linear below 1 kHz and would compress sub-bass to ~5 % of height.
+_LOG_RANGE = float(np.log(_FS_FREQ_HI / _FS_FREQ_LO))        # ln(20000/20) ≈ 6.9
+
+# ── Spectral tilt ─────────────────────────────────────────────────────────────
+# Music energy naturally rolls off at high frequencies (≈ pink noise, -3 dB/oct).
+# A +4.5 dB/decade tilt centred at 1 kHz compensates, making high-frequency
+# content (hi-hats, overtones, air) as visible as bass content.
+# This matches the reference app's "Tilt: 4.5 dB" setting.
+_TILT_DB_PER_DECADE = 4.5
+_TILT_F_REF         = 1000.0   # Hz — tilt pivot frequency
+
+# Per-row frequency map cached by (height, sample_rate) so recomputation is
+# skipped when the same display geometry is reused.
+_cached_row_map: dict = {}   # (height, sample_rate) → (bin_lo, bin_hi, frac)
 
 
+def _get_row_map(height: int, sample_rate: int):
+    """Return (bin_lo, bin_hi, frac) arrays for log-frequency row mapping.
 
+    Maps each display row to a pair of adjacent FFT bins (for linear interpolation)
+    using a log frequency scale from _FS_FREQ_LO to _FS_FREQ_HI.
+    Each octave gets equal vertical space; with _FS_FREQ_LO=20 Hz the sub-bass
+    region (20-200 Hz) occupies ~30 % of the display height.
+    sample_rate must match the audio that will be FFT'd.
+    """
+    key = (height, sample_rate)
+    if key in _cached_row_map:
+        return _cached_row_map[key]
+    t         = np.arange(height, dtype=np.float32) / max(height - 1, 1)
+    freq_row  = _FS_FREQ_HI * np.exp(-t * _LOG_RANGE)  # row 0=top=high, row h-1=bottom=low
+    freq_row  = np.clip(freq_row, _FS_FREQ_LO, _FS_FREQ_HI)
+    # FFT bins are linearly spaced: bin_k = k * sample_rate / FFT_SIZE
+    n_fft     = (_N_BINS - 1) * 2                       # = FFT_SIZE
+    bin_f     = np.clip(freq_row * n_fft / sample_rate, 0.0, float(_N_BINS - 1))
+    bin_lo    = np.clip(np.floor(bin_f).astype(np.int32), 0, _N_BINS - 1)
+    bin_hi    = np.clip(bin_lo + 1,                        0, _N_BINS - 1)
+    frac      = (bin_f - np.floor(bin_f)).astype(np.float32)
+    result    = (bin_lo, bin_hi, frac)
+    _cached_row_map[key] = result
+    return result
+
+
+def decode_sample_rate(native_rate: int) -> int:
+    """Return the sample rate to use for spectrogram decoding.
+
+    Files at or below _SR_MAX are decoded at native rate (no resampling, no
+    aliasing artefacts).  High-res files (96/192 kHz) are decoded at _SR_MAX —
+    we only need Nyquist > _FS_FREQ_HI = 20 kHz, so 48 kHz is always sufficient.
+    """
+    return min(native_rate, _SR_MAX)
+
+
+def n_cols_for_samples(n_samp: int, wave_w: int) -> int:
+    """Return the texture column count to use for a file with n_samp samples.
+
+    Uses _HOP_SIZE (50% overlap) so a 4-min track at 44100 Hz yields ~10 000
+    frames before the _N_COLS_MAX cap, giving ~23 ms effective time resolution
+    for kick drums and transients.
+    """
+    fft_frames = max(1, n_samp // _HOP_SIZE)
+    return max(wave_w, min(_N_COLS_MAX, fft_frames))
+
+
+def compute_static(
+    samples,            # float32 mono or stereo, normalised to ±1
+    n_cols: int,
+    height: int,
+    sample_rate: int,   # actual decode sample rate — MUST match what was used to decode samples
+) -> np.ndarray:
+    """Pre-compute the full-file spectrogram as an (height, n_cols, 4) float32 RGBA array.
+
+    Called from a background thread at load time.  Returns a numpy array ready
+    for SpectrogramStrip.set_data().
+
+    samples:     float32 audio, amplitude range ±1.  Decoded at `sample_rate` Hz.
+                 Do NOT pass extract_waveform() data — that is 4000 Hz and gives
+                 completely wrong frequency mapping.
+    n_cols:      texture width — use n_cols_for_samples() for the right value.
+    height:      display height — frequency rows mapped log-scale.
+    sample_rate: the sample rate of `samples` — used for FFT bin→frequency mapping.
+                 Must use decode_sample_rate(native_rate) to determine this value.
+
+    Fully vectorised: batch rfft over all columns at once — no Python for-loop.
+    """
+    n_cols  = max(1, n_cols)
+    height  = max(1, height)
+    arr     = np.asarray(samples, dtype=np.float32)
+
+    # Convert stereo to mono if needed
+    if arr.ndim == 2:
+        arr = arr.mean(axis=1)
+
+    n_samp = len(arr)
+    if n_samp < _FFT_SIZE:
+        # Too short — return blank texture
+        return np.zeros((height, n_cols, 4), dtype=np.float32)
+
+    # Input is already normalised float32 ±1 — no division needed.
+
+    # Column centre positions in sample space (evenly spaced across file)
+    centres = np.linspace(_FFT_SIZE // 2, n_samp - _FFT_SIZE // 2 - 1,
+                          n_cols, dtype=np.float32).astype(np.int32)
+
+    # Build (n_cols, FFT_SIZE) raw frame matrix (unwindowed — windows applied below)
+    starts  = centres - _FFT_SIZE // 2
+    indices = starts[:, None] + np.arange(_FFT_SIZE, dtype=np.int32)[None, :]
+    raw     = arr[indices]                                          # (n_cols, FFT_SIZE)
+
+    # ── Three batch FFTs for reassignment ────────────────────────────────────
+    # X_h:  standard Hann-windowed FFT — magnitude source
+    # X_dh: Hann-derivative window — encodes instantaneous frequency deviation
+    # (Group delay / X_th not needed for static display — only frequency matters)
+    X_h  = np.fft.rfft(raw * _HANN[None, :],    axis=1)           # (n_cols, n_bins) complex
+    X_dh = np.fft.rfft(raw * _HANN_DH[None, :], axis=1)
+
+    mag = (np.abs(X_h) / _FFT_NORM).astype(np.float32)            # (n_cols, n_bins) normalised
+
+    # ── Instantaneous frequency (reassigned bin position) ────────────────────
+    # ω̂(k) = k - Im(X_dh[k] / X_h[k]) * FFT_SIZE / (2π)
+    # Guard bins where X_h ≈ 0 — phase is meaningless there.
+    ratio     = X_dh / np.where(np.abs(X_h) > 1e-10, X_h, 1e-10) # (n_cols, n_bins)
+    k_bins    = np.arange(_N_BINS, dtype=np.float32)[None, :]      # (1, n_bins)
+    # Sign is SUBTRACT — see research/NOTES.md for derivation
+    omega_hat = (k_bins - np.imag(ratio).astype(np.float32)
+                 * (_FFT_SIZE / (2.0 * np.pi)))                    # (n_cols, n_bins)
+    omega_hat = np.clip(omega_hat, 0.0, float(_N_BINS - 1))
+
+    # ── Noise gate — absolute amplitude threshold ─────────────────────────────
+    # Matches _SPECTRUM_DB_FLOOR (-70 dBFS): bins below this map to black in
+    # the colormap regardless, so there is no visual benefit to scattering them.
+    # This is purely a phase-reliability guard — phase estimates for near-zero
+    # bins are numerically unreliable and would scatter to random rows.
+    _MAG_GATE = 10.0 ** (_SPECTRUM_DB_FLOOR / 20.0)               # ≈ 0.000316 normalised
+    valid     = (mag > _MAG_GATE).ravel()                          # (n_cols*n_bins,) bool
+
+    # ── Map reassigned fractional bin → display row (log-frequency) ─────────
+    freq_hat  = omega_hat * (sample_rate / float(_FFT_SIZE))       # (n_cols, n_bins)
+    freq_hat  = np.clip(freq_hat, _FS_FREQ_LO, _FS_FREQ_HI)
+    t_row     = np.log(_FS_FREQ_HI / freq_hat) / _LOG_RANGE       # 0=top(high), 1=bottom(low)
+    row_idx   = np.clip(
+        np.round(t_row * (height - 1)).astype(np.int32), 0, height - 1
+    )                                                               # (n_cols, n_bins)
+
+    # ── Scatter-accumulate using mag^1.5 (power-law emphasis) ────────────────
+    # mag^1.5 makes strong harmonics accumulate more than weak noise while still
+    # preserving quiet content (unlike a relative threshold which discards it).
+    col_flat    = np.repeat(np.arange(n_cols, dtype=np.int32), _N_BINS)
+    row_flat    = row_idx.ravel()
+    scatter_val = (mag ** 1.5).ravel()
+
+    out_lin     = np.zeros((height, n_cols), dtype=np.float32)
+    np.add.at(out_lin, (row_flat[valid], col_flat[valid]), scatter_val[valid])
+
+    # ── Per-band post-scatter floor ───────────────────────────────────────────
+    # A global column-max floor lets loud bass set the threshold for everything
+    # else — quiet hi-hats and transients at -40 dBFS relative to a kick drum
+    # get wiped.  Instead split the row axis into log-frequency bands and apply
+    # the floor relative to each band's own peak.  This way the high-frequency
+    # region is normalised independently and short transients survive regardless
+    # of what's happening in the bass.
+    # The display is already log-scaled so equal row-count bands ≈ equal octaves.
+    # Per-band floor at 1 % — just removes numerical noise from empty bands.
+    # Real content is let through at near-full density; the colormap dBFS floor
+    # handles the perceptual noise floor.
+    _N_BANDS = 6
+    band_h   = max(1, height // _N_BANDS)
+    for b in range(_N_BANDS):
+        r0    = b * band_h
+        r1    = height if b == _N_BANDS - 1 else r0 + band_h
+        band  = out_lin[r0:r1, :]
+        bmax  = np.maximum(band.max(axis=0, keepdims=True), 1e-10)
+        out_lin[r0:r1, :] *= (band > bmax * 0.01)
+
+    # ── Vertical max-dilation — widen thin lines for visual clarity ───────────
+    # Reassignment collapses harmonics to 1-pixel-wide lines which are
+    # analytically precise but visually faint.  A ±1 row max-dilation
+    # widens each line to 3 pixels without moving its centre or adding energy
+    # where there is none.  The dilation uses the original (pre-dilation) values
+    # so energy doesn't compound across multiple passes.
+    padded  = np.pad(out_lin, ((1, 1), (0, 0)), mode='constant', constant_values=0.0)
+    out_lin = np.maximum(np.maximum(padded[:-2, :], padded[1:-1, :]), padded[2:, :])
+
+    # ── dBFS + spectral tilt → 0..1 → LUT → RGBA ────────────────────────────
+    db = 20.0 * np.log10(np.maximum(out_lin, 1e-7))                # (height, n_cols)
+
+    # Spectral tilt: +4.5 dB/decade above 1 kHz, -4.5 dB/decade below.
+    # Applied per display row using the log-scale frequency at each row.
+    # Boosts high-frequency content to compensate for music's natural roll-off.
+    row_t      = np.arange(height, dtype=np.float32) / max(height - 1, 1)
+    freq_rows  = (_FS_FREQ_HI * np.exp(-row_t * _LOG_RANGE)).astype(np.float32)
+    tilt_db    = (_TILT_DB_PER_DECADE
+                  * np.log10(np.maximum(freq_rows, 1.0) / _TILT_F_REF)
+                  ).astype(np.float32)                              # (height,)
+    db         = db + tilt_db[:, np.newaxis]
+
+    amp_rows = np.clip(
+        (db - _SPECTRUM_DB_FLOOR) / (-_SPECTRUM_DB_FLOOR), 0.0, 1.0
+    ).astype(np.float32)                                            # (height, n_cols)
+
+    lut_idx      = np.clip((amp_rows * 255.0).astype(np.int32), 0, 255)
+    rgb          = _LUT[lut_idx]                                   # (height, n_cols, 3)
+
+    out          = np.empty((height, n_cols, 4), dtype=np.float32)
+    out[..., :3] = rgb
+    out[..., 3]  = 0.9
+
+    return out
+
+
+# ── SpectrogramStrip ─────────────────────────────────────────────────────────
 
 class SpectrogramStrip:
-    """Scrolling spectrogram overlay drawn into a parent DPG drawlist."""
+    """UV-scrolling spectrogram overlay.
+
+    The texture covers the full file (up to _N_COLS_MAX columns) and is uploaded
+    once at load time.  During playback, set_scroll(pos_norm) shifts the visible
+    UV window so the playhead stays pinned at the right edge of the display — zero
+    texture uploads per frame, one configure_item call.
+
+    Early playback: the display fills from the right (black on left) until enough
+    history has accumulated to fill the full wave_w display width.
+    """
 
     def __init__(
         self,
@@ -60,173 +319,153 @@ class SpectrogramStrip:
         drawlist_tag: int | str,
         width: int,
         height: int,
-        active_color: str,   # accepted for API compatibility, not used for palette
-        scroll_step: int = 2,
+        active_color: str,   # API-compat; palette is fixed
+        scroll_step: int = 2,  # API-compat; unused
+        x_offset: int = 0,
     ) -> None:
-        self._dl          = drawlist_tag
-        self._width       = max(1, width)
-        self._height      = max(1, height)
-        self._visible     = False   # hidden by default; enabled via set_visible
-        self._scroll_step = max(1, scroll_step)
+        self._wave_w       = max(1, width)   # display width in screen pixels
+        self._height       = max(1, height)
+        self._x_offset     = x_offset
+        self._visible      = False
+        self._tex_registry = tex_registry
+        self._zoom         = 1.0             # time-axis zoom; set via set_zoom()
 
-        # Dim multiplier when track is not the active one
-        self._brightness = 1.0   # 1.0 = active, 0.5 = inactive
-
-        # RGBA float32 pixel buffer: shape (height, width, 4)
-        self._buf = np.zeros((self._height, self._width, 4), dtype=np.float32)
-
-        # DPG dynamic texture (registered into the app's shared texture_registry)
-        self._tex = dpg.add_dynamic_texture(
-            self._width, self._height, self._buf.ravel(), parent=tex_registry,
+        # Placeholder texture — same width as display until set_data() arrives
+        self._n_cols = self._wave_w
+        flat = np.zeros(self._n_cols * self._height * 4, dtype=np.float32)
+        self._tag = dpg.add_raw_texture(
+            self._n_cols, self._height, flat,
+            format=dpg.mvFormat_Float_rgba,
+            parent=tex_registry,
         )
-
-        # Draw image into the drawlist (covers the full waveform area)
+        # draw_image starts with zero UV width → invisible until set_scroll fires
         self._img = dpg.draw_image(
-            self._tex,
-            pmin=(0, 0),
-            pmax=(self._width, self._height),
+            self._tag,
+            pmin=(x_offset, 0), pmax=(x_offset, self._height),
+            uv_min=(0, 0), uv_max=(0, 1),
             show=self._visible,
-            parent=self._dl,
+            parent=drawlist_tag,
         )
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def update(self, raw_bands: np.ndarray | None, n_bands: int,
-               raw_bins: bool = False) -> None:
-        """Scroll buffer left by one pixel and paint new column from raw_bands.
+    def set_data(self, rgba_buf: np.ndarray) -> None:
+        """Upload pre-computed (height, n_cols, 4) float32 RGBA data.
 
-        raw_bins=False (default): raw_bands is dBFS band averages, length n_bands.
-        raw_bins=True  (fullscreen): raw_bands is linear reassigned magnitudes,
-            length = FFT_SIZE//2+1.  Each pixel row is mapped to its exact
-            frequency via log-frequency interpolation — no band quantization.
+        The texture is (re)created whenever its dimensions change — either because
+        compute_static used a higher-resolution n_cols than the placeholder, or
+        because the buffer height differs from self._height (e.g. fullscreen strip
+        receiving slot-height data would crash without this guard).  Always uses
+        the actual dimensions of rgba_buf.
         """
-        if not self._visible:
-            return
+        new_rows   = rgba_buf.shape[0]
+        new_n_cols = rgba_buf.shape[1]
+        flat       = rgba_buf.ravel()
 
-        w  = self._width
-        h  = self._height
-        br = self._brightness
-
-        # Scroll: shift all columns left by scroll_step
-        s = self._scroll_step
-        if w > s:
-            self._buf[:, :w - s, :] = self._buf[:, s:, :]
-        self._buf[:, w - s:, :] = 0.0   # clear the newly exposed columns
-
-        # Build the new rightmost column
-        col = np.zeros((h, 4), dtype=np.float32)
-
-        if raw_bands is not None and len(raw_bands) > 0:
-            # t=0.0 at top row (high freq), t=1.0 at bottom row (low freq).
-            # Pure log-frequency mapping — equal pixel density per octave.
-            row_indices = np.arange(h, dtype=np.float32)
-            t_mapped    = row_indices / max(h - 1, 1)
-
-            if raw_bins:
-                # ── Fullscreen row→bin interpolation ──────────────────────────
-                # For each display row, compute its exact (fractional) FFT bin
-                # and linearly interpolate the reassigned spectrum.  Fills every
-                # row smoothly regardless of how many bins map to a given range.
-                n_bins_r = len(raw_bands)
-                n_fft_r  = (n_bins_r - 1) * 2
-
-                # t_mapped is the log-frequency coordinate:
-                #   0 = top row / FREQ_HI,  1 = bottom row / FREQ_LO.
-                log_range  = np.log(_FS_FREQ_HI / _FS_FREQ_LO)
-                freq_row   = _FS_FREQ_HI * np.exp(-t_mapped * log_range)
-                freq_row   = np.clip(freq_row, _FS_FREQ_LO, _FS_FREQ_HI)
-
-                # Fractional bin for each row
-                bin_f  = freq_row * n_fft_r / _SAMPLERATE
-                bin_f  = np.clip(bin_f, 0.0, float(n_bins_r - 1))
-                bin_lo = np.clip(np.floor(bin_f).astype(np.int32), 0, n_bins_r - 1)
-                bin_hi = np.clip(bin_lo + 1,                        0, n_bins_r - 1)
-                frac_b = (bin_f - np.floor(bin_f)).astype(np.float32)
-
-                # Interpolate raw linear magnitudes, THEN convert to dBFS.
-                # Interpolating in linear space before log gives correct envelope.
-                interp_lin = (raw_bands[bin_lo] * (1.0 - frac_b)
-                              + raw_bands[bin_hi] * frac_b)
-                db_row  = 20.0 * np.log10(np.maximum(interp_lin, 1e-6))
-                amp     = np.clip(
-                    (db_row - _SPECTRUM_DB_FLOOR) / (-_SPECTRUM_DB_FLOOR),
-                    0.0, 1.0,
-                ).astype(np.float32)
-            else:
-                # ── Normal band mode ──────────────────────────────────────────
-                nb = len(raw_bands)
-                # Convert dB bands to 0..1 fractions
-                fracs = np.clip(
-                    (raw_bands - _SPECTRUM_DB_FLOOR) / (-_SPECTRUM_DB_FLOOR),
-                    0.0, 1.0,
-                ).astype(np.float32)
-                # band_frac 0 (top) → high band (nb-1); 1 (bottom) → low band (0)
-                band_for_row = np.clip(
-                    ((1.0 - t_mapped) * nb).astype(np.int32), 0, nb - 1
-                )
-                amp = fracs[band_for_row]   # shape: (h,)
-
-            # Look up RGB from LUT
-            lut_idx = np.clip((amp * 255.0).astype(np.int32), 0, 255)
-            rgb = _LUT[lut_idx]   # shape: (h, 3)
-
-            col[:, 0] = rgb[:, 0] * br
-            col[:, 1] = rgb[:, 1] * br
-            col[:, 2] = rgb[:, 2] * br
-            col[:, 3] = 0.92   # always opaque; LUT maps silence to black
-
-        # Write new column into all scroll_step newly exposed slots
-        self._buf[:, w - self._scroll_step:, :] = col[:, np.newaxis, :]
-        dpg.set_value(self._tex, self._buf.ravel())
-
-    def set_visible(self, visible: bool) -> None:
-        self._visible = visible
-        try:
-            dpg.configure_item(self._img, show=visible)
-        except Exception:
-            pass
-        if not visible:
-            # Clear buffer so it starts fresh next time it becomes visible
-            self._buf[:] = 0.0
+        if new_n_cols != self._n_cols or new_rows != self._height:
+            # Dimensions changed — create new texture at correct size, rebind, delete old
+            old_tag = self._tag
+            self._tag = dpg.add_raw_texture(
+                new_n_cols, new_rows, flat,
+                format=dpg.mvFormat_Float_rgba,
+                parent=self._tex_registry,
+            )
+            self._n_cols  = new_n_cols
+            self._height  = new_rows
+            if dpg.does_item_exist(self._img):
+                dpg.configure_item(self._img,
+                                   texture_tag=self._tag,
+                                   pmax=(self._x_offset + self._wave_w, self._height))
             try:
-                dpg.set_value(self._tex, self._buf.ravel())
+                dpg.delete_item(old_tag)
             except Exception:
                 pass
+        else:
+            if dpg.does_item_exist(self._tag):
+                dpg.set_value(self._tag, flat)
+
+    def set_zoom(self, factor: float) -> None:
+        """Set the time-axis zoom factor.
+
+        factor = 1.0 — one texture column per display pixel (compressed, full history).
+        factor = 4.0 — one texture column per 4 display pixels (zoomed in, less history
+                        visible but each time frame is 4× wider on screen).
+
+        Higher values make the spectrogram scroll faster — fewer seconds of audio fit
+        in the display width, so transient events (kicks, hi-hats) are more readable.
+        Does not require re-computing the texture.
+        """
+        self._zoom = max(1.0, float(factor))
+
+    def set_scroll(self, pos_norm: float) -> None:
+        """Update the visible UV window so the spectrogram scrolls with playback.
+
+        pos_norm: current playback position as a fraction of file duration (0..1).
+
+        The visible window shows the last (wave_w / zoom) texture columns ending at the
+        current position, stretched across the full wave_w display pixels.
+        When there is not enough history to fill the window, the image is pinned to the
+        right and the slot background shows on the left.
+        """
+        if not self._visible or not dpg.does_item_exist(self._img):
+            return
+
+        n   = self._n_cols
+        w   = self._wave_w
+        xo  = self._x_offset
+        h   = self._height
+        # Number of texture columns to display across wave_w pixels.
+        # zoom > 1 → fewer columns shown → each column wider → faster scroll.
+        vis = max(1, round(w / self._zoom))
+
+        # Texture columns available up to the current playhead
+        avail = round(pos_norm * n)
+        avail = max(0, min(avail, n))
+
+        if avail <= 0:
+            # Nothing yet — zero-width image
+            dpg.configure_item(self._img,
+                               pmin=(xo, 0), pmax=(xo, h),
+                               uv_min=(0, 0), uv_max=(0, 1))
+            return
+
+        if avail >= vis:
+            # Full display: show the last vis columns stretched to wave_w pixels
+            uv_right = avail / n
+            uv_left  = (avail - vis) / n
+            dpg.configure_item(self._img,
+                               pmin=(xo, 0), pmax=(xo + w, h),
+                               uv_min=(uv_left, 0), uv_max=(uv_right, 1))
+        else:
+            # Not enough history yet — show avail columns proportionally at right
+            screen_w = round(w * avail / vis)
+            uv_right = avail / n
+            dpg.configure_item(self._img,
+                               pmin=(xo + w - screen_w, 0), pmax=(xo + w, h),
+                               uv_min=(0, 0), uv_max=(uv_right, 1))
+
+    def set_visible(self, visible: bool) -> None:
+        if visible == self._visible:
+            return
+        self._visible = visible
+        if dpg.does_item_exist(self._img):
+            dpg.configure_item(self._img, show=visible)
 
     def set_active(self, is_active: bool) -> None:
-        self._brightness = 1.0 if is_active else 0.5
+        pass   # brightness dimming reserved for future use
 
-    def get_buffer(self) -> np.ndarray:
-        """Return a copy of the current RGBA pixel buffer (height, width, 4)."""
-        return self._buf.copy()
+    def get_buffer(self) -> np.ndarray | None:
+        """Not used in UV-scroll mode — returns None."""
+        return None
 
-    def seed_from_buffer(self, src: np.ndarray) -> None:
-        """Bilinearly resize src (any height, same width, 4ch) into this buffer
-        and upload to GPU.  Used to pre-populate fullscreen from slot strip."""
-        sh, sw = src.shape[:2]
-        dh, dw = self._height, self._width
-        if sw != dw:
-            # Width mismatch — just clear rather than stretch horizontally
-            self._buf[:] = 0.0
-        else:
-            row_f  = np.linspace(0.0, sh - 1, dh, dtype=np.float32)
-            row_lo = np.clip(np.floor(row_f).astype(np.int32), 0, sh - 1)
-            row_hi = np.clip(row_lo + 1,                        0, sh - 1)
-            frac   = row_f - np.floor(row_f)
-            frac   = frac[:, np.newaxis, np.newaxis].astype(np.float32)
-            self._buf[:] = src[row_lo] * (1.0 - frac) + src[row_hi] * frac
-        try:
-            dpg.set_value(self._tex, self._buf.ravel())
-        except Exception:
-            pass
+    def seed_from_buffer(self, src) -> None:
+        """Not used in UV-scroll mode — no-op."""
+        pass
 
     def delete(self) -> None:
+        """Delete the DPG texture.  draw_image is a drawlist child — cleaned
+        up automatically when the drawlist is deleted."""
         try:
-            dpg.delete_item(self._img)
+            dpg.delete_item(self._tag)
         except Exception:
             pass
-        try:
-            dpg.delete_item(self._tex)
-        except Exception:
-            pass
-        self._buf = np.zeros((1, 1, 4), dtype=np.float32)
