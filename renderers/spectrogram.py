@@ -476,15 +476,22 @@ class SpectrogramStrip:
         else:
             self._zoom = max(1.0, float(factor))
 
-    def set_scroll(self, pos_norm: float) -> None:
+    def set_scroll(self, pos_norm: float, dur_frac: float = 1.0) -> None:
         """Update visible UV windows across all tiles for the current playhead.
 
         zoom == 0.0 (full-track mode): all tiles are shown across the full slot
         width simultaneously; pos_norm is only used externally for the playhead
         line position — this method just ensures the full texture is always visible.
+
+        dur_frac: track_duration / longest_track_duration (1.0 for longest track).
+        Scales avail and vis so all tracks use the same time-per-pixel standard,
+        keeping scrolling speeds in sync regardless of individual track durations.
+        Shorter tracks show dark background past their end (no texture there).
         """
         if not self._visible or not self._tile_items:
             return
+
+        dur_frac = max(1e-6, min(1.0, dur_frac))
 
         n   = self._total_cols
         w   = self._wave_w
@@ -492,25 +499,31 @@ class SpectrogramStrip:
         h   = self._height
 
         if self._zoom == 0.0:
-            # Full-track mode: map entire texture across all tiles to full slot width.
+            # Full-track mode: map texture across its proportional share of wave_w.
+            # A track shorter than the longest gets a narrower pixel band; the rest
+            # is dark background — matching the same time-per-pixel standard.
             for item in self._tile_items:
                 img = item['img']
                 if not dpg.does_item_exist(img):
                     continue
                 t_start = item['t_start']
                 t_ncols = item['t_ncols']
-                # Pixel extents: each tile occupies its proportional share of wave_w
-                px_left  = xo + round(t_start / n * w)
-                px_right = xo + round((t_start + t_ncols) / n * w)
+                # Pixel extents scaled to the track's proportional width
+                px_left  = xo + round(t_start / n * dur_frac * w)
+                px_right = xo + round((t_start + t_ncols) / n * dur_frac * w)
                 dpg.configure_item(img,
                                    pmin=(px_left, 0), pmax=(px_right, h),
                                    uv_min=(0, 0), uv_max=(1, 1))
             return
 
-        vis = max(1, round(w / self._zoom))
-
-        avail    = max(0, min(round(pos_norm * n), n))
-        left_col = avail - vis   # negative during early playback
+        # Scroll mode: "now" is pinned at the right edge.
+        # Keep vis_f and avail_f as floats — rounding them to integers causes each
+        # track to cross its rounding threshold at a different frame, producing
+        # visible jitter between strips. Only round at the final pixel position.
+        vis_f      = max(1.0, w / self._zoom / dur_frac)
+        avail_f    = min(pos_norm / dur_frac * n, float(n))
+        avail_f    = max(0.0, avail_f)
+        left_col_f = avail_f - vis_f   # negative during early playback
 
         for item in self._tile_items:
             img = item['img']
@@ -521,26 +534,26 @@ class SpectrogramStrip:
             t_ncols = item['t_ncols']
             t_end   = t_start + t_ncols
 
-            # Content columns from this tile that fall in the visible window
-            c_left  = max(max(0, left_col), t_start)
-            c_right = min(avail, t_end)
+            # Content columns (float) from this tile that fall in the visible window
+            c_left_f  = max(max(0.0, left_col_f), float(t_start))
+            c_right_f = min(avail_f, float(t_end))
 
-            if c_left >= c_right or avail <= 0:
+            if c_left_f >= c_right_f or avail_f <= 0.0:
                 # Tile not in view — zero width
                 dpg.configure_item(img,
                                    pmin=(xo, 0), pmax=(xo, h),
                                    uv_min=(0, 0), uv_max=(0, 1))
                 continue
 
-            # Screen pixel extents for this tile's visible slice
-            px_left  = xo + round((c_left  - left_col) / vis * w)
-            px_right = xo + round((c_right - left_col) / vis * w)
+            # Screen pixel extents — round only here so all strips step together
+            px_left  = xo + round((c_left_f  - left_col_f) / vis_f * w)
+            px_right = xo + round((c_right_f - left_col_f) / vis_f * w)
             px_left  = max(xo, px_left)
             px_right = min(xo + w, px_right)
 
             # UV coordinates within this tile
-            uv_left  = (c_left  - t_start) / t_ncols
-            uv_right = (c_right - t_start) / t_ncols
+            uv_left  = (c_left_f  - t_start) / t_ncols
+            uv_right = (c_right_f - t_start) / t_ncols
 
             dpg.configure_item(img,
                                pmin=(px_left, 0), pmax=(px_right, h),

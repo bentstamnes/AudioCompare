@@ -13,6 +13,10 @@ Tracked sections (instrumented in app.py):
   meters            — sample_levels + meter/corr bar updates
   spectrum_dispatch — _update_spectrum call (thread dispatch only, not compute)
 
+Per-callback tracking (drain_queue callbacks timed individually):
+  Columns added per name in CALLBACK_SECTIONS: {name}_mean_ms, {name}_max_ms
+  record_callback(name, elapsed_ms) accumulates these; called from _drain_queue.
+
 Usage:
   tracker = PerfTracker()
   path = tracker.enable(log_dir)   # start; returns CSV path
@@ -22,6 +26,8 @@ Usage:
   ...
   tracker.end_section("waveform")
   tracker.end_tick()
+  # from _drain_queue, per callback:
+  tracker.record_callback("_on_wave_done", elapsed_ms)
   # when done:
   tracker.disable()
 """
@@ -41,6 +47,17 @@ SECTIONS = (
     "waveform",
     "meters",
     "spectrum_dispatch",
+)
+
+# drain_queue callbacks timed individually — reported as extra CSV columns.
+CALLBACK_SECTIONS = (
+    "_on_decode_done",
+    "_on_wave_done",
+    "_on_wave_render_done",
+    "_on_lufs_done",
+    "_apply_spectrum",
+    "_on_spectro_done",
+    "_on_spectro_fs_done",
 )
 
 _FLUSH_INTERVAL = 1.0   # seconds between CSV rows
@@ -69,6 +86,7 @@ class PerfTracker:
 
         self._tick_times: list = []
         self._section_times: dict = {s: [] for s in SECTIONS}
+        self._callback_times: dict = {c: [] for c in CALLBACK_SECTIONS}
 
         self._tick_start:    float = 0.0
         self._section_start: dict  = {}
@@ -97,6 +115,8 @@ class PerfTracker:
         for s in SECTIONS:
             header += [f"{s}_mean_ms", f"{s}_max_ms"]
         header.append("frames")
+        for c in CALLBACK_SECTIONS:
+            header += [f"{c}_mean_ms", f"{c}_max_ms"]
         self._writer.writerow(header)
 
         now = time.perf_counter()
@@ -105,6 +125,8 @@ class PerfTracker:
         self._tick_times.clear()
         for s in SECTIONS:
             self._section_times[s].clear()
+        for c in CALLBACK_SECTIONS:
+            self._callback_times[c].clear()
         self._log_path = path
         self._enabled = True
         return path
@@ -151,6 +173,18 @@ class PerfTracker:
         if t is not None:
             self._section_times[name].append((time.perf_counter() - t) * 1000.0)
 
+    def record_callback(self, name: str, elapsed_ms: float) -> None:
+        """Record the elapsed time for a single drain_queue callback execution.
+
+        name should be the callback's __name__ string.  Unknown names are silently
+        ignored so _drain_queue needs no conditional logic.
+        """
+        if not self._enabled:
+            return
+        lst = self._callback_times.get(name)
+        if lst is not None:
+            lst.append(elapsed_ms)
+
     # ── Internal ───────────────────────────────────────────────────────────────
 
     def _flush(self) -> None:
@@ -182,8 +216,19 @@ class PerfTracker:
                 row += ["", ""]
         row.append(fps)
 
+        for c in CALLBACK_SECTIONS:
+            ct = self._callback_times[c]
+            if ct:
+                cmn = sum(ct) / len(ct)
+                cmx = max(ct)
+                row += [f"{cmn:.3f}", f"{cmx:.3f}"]
+            else:
+                row += ["", ""]
+
         self._writer.writerow(row)
 
         self._tick_times.clear()
         for s in SECTIONS:
             self._section_times[s].clear()
+        for c in CALLBACK_SECTIONS:
+            self._callback_times[c].clear()

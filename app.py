@@ -141,21 +141,24 @@ import atexit as _atexit
 _DBG_PATH = os.path.join(
     os.environ.get("APPDATA", os.path.expanduser("~")), "MixABTestGPU", "debug.log"
 )
-_dbg = None
-def _dbg_open():
-    global _dbg
+# Log lines accumulate in memory; written to disk once at shutdown.
+# Zero disk I/O during the render loop — safe to call from any thread.
+_dbg_lines: list[str] = []
+
+def _dbg_flush():
+    if not _dbg_lines:
+        return
     try:
         os.makedirs(os.path.dirname(_DBG_PATH), exist_ok=True)
-        _dbg = open(_DBG_PATH, "w", encoding="utf-8", buffering=1)
-        _atexit.register(lambda: _dbg.close() if _dbg else None)
+        with open(_DBG_PATH, "w", encoding="utf-8") as f:
+            f.writelines(_dbg_lines)
     except Exception:
         pass
-_dbg_open()
+
+_atexit.register(_dbg_flush)
 
 def _log(*args):
-    if _dbg:
-        import traceback as _tb
-        _dbg.write(" ".join(str(a) for a in args) + "\n")
+    _dbg_lines.append(" ".join(str(a) for a in args) + "\n")
 
 
 class MixABTestGPU:
@@ -1201,6 +1204,55 @@ class MixABTestGPU:
             self._post(_log, f"_wave_thread EXCEPTION idx={idx}: {traceback.format_exc()}")
             self._post(self._dec_processing, "waveform")
 
+    def _launch_wave_render(self, idx: int) -> None:
+        """Start a background thread to render waveform buffers for slot idx.
+
+        Gathers the current scale parameters on the main thread (where they
+        are safely readable), then delegates the numpy-heavy buffer fill to a
+        daemon thread.  Only the final dpg.set_value upload runs on the main
+        thread via _on_wave_render_done.
+        """
+        if idx >= len(self._tracks):
+            return
+        tex = self._slot_textures[idx]
+        if not tex:
+            return
+        t = self._tracks[idx]
+        if not t.get("wave_raw"):
+            return
+        threading.Thread(
+            target=self._wave_render_thread,
+            args=(
+                idx, t["path"], tex,
+                t["wave_raw"], t["duration"], self._max_dur,
+                t.get("wave_peak", 1), self._wave_global_peak,
+                self._wave_normalize and len(self._tracks) > 1,
+            ),
+            daemon=True,
+        ).start()
+
+    def _wave_render_thread(self, idx: int, path: str, tex,
+                            samples, track_dur, max_dur,
+                            wave_peak, wave_global_peak, normalize) -> None:
+        """Background: fill waveform RGB buffers, then post upload to main thread."""
+        try:
+            buf_p, buf_r = tex.render_buffers(
+                samples, track_dur, max_dur, wave_peak, wave_global_peak, normalize,
+            )
+            self._post(self._on_wave_render_done, idx, path, buf_p, buf_r)
+        except Exception:
+            import traceback
+            self._post(_log, f"_wave_render_thread EXCEPTION idx={idx}: {traceback.format_exc()}")
+
+    def _on_wave_render_done(self, idx: int, path: str,
+                             buf_played, buf_rest) -> None:
+        """Main thread: upload pre-rendered waveform buffers to GPU."""
+        if idx >= len(self._tracks) or self._tracks[idx]["path"] != path:
+            return
+        tex = self._slot_textures[idx]
+        if tex:
+            tex.upload_buffers(buf_played, buf_rest)
+
     def _on_wave_done(self, idx: int, path: str, samples: tuple, peak: int) -> None:
         _log(f"_on_wave_done idx={idx} samples={len(samples)} tex={self._slot_textures[idx] is not None}")
         self._dec_processing("waveform")
@@ -1214,14 +1266,17 @@ class MixABTestGPU:
         scale_changed = self._recalc_wave_scale()
         if scale_changed and self._wave_normalize:
             for i in range(len(self._tracks)):
-                self._refresh_track_waveform(i)
+                self._launch_wave_render(i)
         else:
-            self._refresh_track_waveform(idx)
+            self._launch_wave_render(idx)
 
-        # Launch static spectrogram computation in a background thread.
-        # Compute the mode-appropriate version first; the other version follows
-        # in the background once the primary is done (see _on_spectro_done /
-        # _on_spectro_fs_done).
+        # Launch static spectrogram computation in a background thread only if
+        # FFT features are enabled.  If both spectrum overlay and spectrogram are
+        # off, skip computation entirely — it can be triggered later if the user
+        # enables either feature via the menu.
+        if not (self._spectrum_enabled or self._spectrogram_enabled or self._spectrogram_fullscreen):
+            return
+
         wave_w = max(1, self._track_area_w - METER_W)
         slot_h = max(1, (self._track_area_h - _TRACK_PAD * (MAX_TRACKS - 1)) // MAX_TRACKS)
         if self._spectrogram_fullscreen:
@@ -1477,7 +1532,15 @@ class MixABTestGPU:
         while not self._msg_queue.empty():
             try:
                 fn, args = self._msg_queue.get_nowait()
-                fn(*args)
+                if self._perf.enabled:
+                    _t0 = time.perf_counter()
+                    fn(*args)
+                    self._perf.record_callback(
+                        getattr(fn, "__name__", "?"),
+                        (time.perf_counter() - _t0) * 1000.0,
+                    )
+                else:
+                    fn(*args)
             except Exception as _e:
                 _log(f"_drain_queue err in {getattr(fn,'__name__','?')}: {_e}")
 
@@ -1611,10 +1674,13 @@ class MixABTestGPU:
                                        pmin=(0, 0), pmax=(wave_w, slot_h),
                                        uv_min=(0, 0), uv_max=(1, 1))
 
-            # Spectrogram UV scroll — playhead pinned at right edge
+            # Spectrogram UV scroll — playhead pinned at right edge.
+            # dur_frac ensures all tracks scroll at the same time-per-pixel rate
+            # (longest track = 1.0; shorter tracks show dark background past end).
             sg = self._slot_spectrograms[idx] if idx < len(self._slot_spectrograms) else None
             if sg and self._spectrogram_enabled:
-                sg.set_scroll(frac)
+                dur_frac = min(1.0, t["duration"] / max_dur) if max_dur > 0 else 1.0
+                sg.set_scroll(frac, dur_frac)
 
             line_tag = f"slot_play_line_{idx}"
             if play_px >= 0 and dpg.does_item_exist(line_tag):
@@ -1686,8 +1752,10 @@ class MixABTestGPU:
         # Fullscreen spectrogram: UV scroll + playhead at right edge
         if self._spectrogram_fullscreen:
             wave_w = max(1, self._track_area_w - METER_W)
-            if self._fs_strip:
-                self._fs_strip.set_scroll(frac)
+            if self._fs_strip and self._active < len(self._tracks):
+                act_dur  = self._tracks[self._active].get("duration", max_dur) or max_dur
+                fs_dur_frac = min(1.0, act_dur / max_dur) if max_dur > 0 else 1.0
+                self._fs_strip.set_scroll(frac, fs_dur_frac)
             if dpg.does_item_exist("fs_play_line"):
                 dpg.configure_item("fs_play_line",
                                    p1=(wave_w, 0),

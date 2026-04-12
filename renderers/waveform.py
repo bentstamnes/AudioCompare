@@ -192,6 +192,73 @@ class WaveformTexture:
         self._build_upload_played()
         self._build_upload_rest()
 
+    def render_buffers(
+        self,
+        samples: tuple,
+        track_dur: float,
+        max_dur: float,
+        wave_peak: int,
+        wave_global_peak: int,
+        normalize: bool,
+    ) -> tuple:
+        """Pure numpy: compute waveform and fill two new RGB float32 buffers.
+
+        Allocates fresh arrays instead of using self._buf_* so this method is
+        safe to call from a background thread while DPG may still hold a
+        deferred reference to the previous self._buf_* arrays.
+
+        Returns (buf_played, buf_rest) — pass to upload_buffers() on the
+        main thread.
+        """
+        w, h    = self._width, self._height
+        buf_p   = np.empty((h, w, 3), dtype=np.float32)
+        buf_r   = np.empty((h, w, 3), dtype=np.float32)
+        buf_p[:] = self._bg
+        buf_r[:] = self._bg
+
+        if not samples or max_dur <= 0 or track_dur <= 0:
+            return buf_p, buf_r
+
+        px_count = max(1, int(w * min(1.0, track_dur / max_dur)))
+        n        = len(samples)
+        mid      = h / 2.0
+        divisor  = float(wave_global_peak if normalize else (wave_peak or 32768))
+
+        x_arr     = np.arange(px_count, dtype=np.float32)
+        i0_arr    = (x_arr / px_count * n).astype(np.int32)
+        i1_arr    = np.maximum(i0_arr + 1, ((x_arr + 1) / px_count * n).astype(np.int32))
+        i1_arr    = np.minimum(i1_arr, n)
+        samps_arr = np.asarray(samples, dtype=np.int32)
+        abs_samps = np.abs(samps_arr)
+        col_max   = np.maximum.reduceat(abs_samps, i0_arr)[:px_count]
+        amps      = np.maximum(1, (col_max / divisor * mid * 0.85)).astype(np.int32)
+
+        mid_i = int(mid)
+        n_col = min(px_count, w)
+        cols  = np.arange(n_col, dtype=np.int32)
+        # Local mark scratch — do not use self._mark (not thread-safe)
+        mark  = np.zeros((h + 1, w), dtype=np.int8)
+
+        _draw_bars(buf_p, amps[:n_col], cols, mid_i, h, self._active, mark)
+        mark[:] = 0
+        clr = self._inactive if self._is_active else self._dim
+        _draw_bars(buf_r, amps[:n_col], cols, mid_i, h, clr, mark)
+
+        return buf_p, buf_r
+
+    def upload_buffers(self, buf_played: np.ndarray, buf_rest: np.ndarray) -> None:
+        """Upload pre-rendered buffers to GPU. Must be called from the main thread.
+
+        Stores the new arrays as self._buf_* so DPG's deferred reference
+        remains valid until the next frame render.
+        """
+        if dpg.does_item_exist(self._tag_played):
+            dpg.set_value(self._tag_played, buf_played.ravel())
+        if dpg.does_item_exist(self._tag_rest):
+            dpg.set_value(self._tag_rest, buf_rest.ravel())
+        self._buf_played = buf_played
+        self._buf_rest   = buf_rest
+
     def _build_upload_played(self) -> None:
         """Build full waveform in active colour and upload to tag_played."""
         self._buf_played[:] = self._bg

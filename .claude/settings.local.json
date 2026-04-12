@@ -74,7 +74,8 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\('renderers/spectrogram.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(pip install:*)",
       "Bash(python -c \"import ast; ast.parse\\(open\\('renderers/spectrogram.py', encoding='utf-8'\\).read\\(\\)\\); print\\('spectrogram.py OK'\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); print\\('app.py OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); print\\('app.py OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('renderers/waveform.py', encoding='utf-8'\\).read\\(\\)\\); print\\('waveform.py OK'\\)\")"
     ]
   }
 }
