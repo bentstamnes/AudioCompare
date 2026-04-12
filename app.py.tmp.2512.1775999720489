@@ -2051,7 +2051,7 @@ class MixABTestGPU:
                 elif t.get("wave_raw") and idx not in self._spectro_fs_computing:
                     wave_w = max(1, self._track_area_w - METER_W)
                     vh     = self._track_area_h
-                    self._inc_processing("FFT Full")
+                    self._inc_processing("FFT")
                     self._spectro_fs_computing.add(idx)
                     threading.Thread(
                         target=self._spectro_fs_thread,
@@ -2382,7 +2382,7 @@ class MixABTestGPU:
                 self._fs_strip.set_data(t["spectro_fs_rgba"])
                 _apply_from_cache = True
             elif t.get("wave_raw") and self._active not in self._spectro_fs_computing:
-                self._inc_processing("FFT Full")
+                self._inc_processing("FFT")
                 self._spectro_fs_computing.add(self._active)
                 threading.Thread(
                     target=self._spectro_fs_thread,

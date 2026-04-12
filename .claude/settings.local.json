@@ -67,7 +67,10 @@
       "Bash(\"/f/Dropbox/NorthBent/MixABTestGPU/.venv/Scripts/python.exe\" -c \"import ast; ast.parse\\(open\\('f:/Dropbox/NorthBent/MixABTestGPU/mixabtestgpu/renderers/spectrogram.py',encoding='utf-8'\\).read\\(\\)\\); print\\('spectrogram.py OK'\\)\")",
       "Bash(\"/f/Dropbox/NorthBent/MixABTestGPU/.venv/Scripts/python.exe\" -m pip install pymupdf --quiet)",
       "Bash(timeout 14 \"/f/Dropbox/NorthBent/MixABTestGPU/.venv/Scripts/python.exe\" _test_launch.py)",
-      "Bash(python -c ':*)"
+      "Bash(python -c ':*)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); print\\('parse OK'\\)\")"
     ]
   }
 }
