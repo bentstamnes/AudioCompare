@@ -207,8 +207,9 @@ class WaveformTexture:
         safe to call from a background thread while DPG may still hold a
         deferred reference to the previous self._buf_* arrays.
 
-        Returns (buf_played, buf_rest) — pass to upload_buffers() on the
-        main thread.
+        Returns (buf_played, buf_rest, wave_amps, wave_px_count) — pass to
+        upload_buffers() on the main thread so set_active() can later
+        re-render the rest texture on track switches.
         """
         w, h    = self._width, self._height
         buf_p   = np.empty((h, w, 3), dtype=np.float32)
@@ -217,7 +218,7 @@ class WaveformTexture:
         buf_r[:] = self._bg
 
         if not samples or max_dur <= 0 or track_dur <= 0:
-            return buf_p, buf_r
+            return buf_p, buf_r, None, 0
 
         px_count = max(1, int(w * min(1.0, track_dur / max_dur)))
         n        = len(samples)
@@ -244,20 +245,26 @@ class WaveformTexture:
         clr = self._inactive if self._is_active else self._dim
         _draw_bars(buf_r, amps[:n_col], cols, mid_i, h, clr, mark)
 
-        return buf_p, buf_r
+        return buf_p, buf_r, amps, px_count
 
-    def upload_buffers(self, buf_played: np.ndarray, buf_rest: np.ndarray) -> None:
+    def upload_buffers(self, buf_played: np.ndarray, buf_rest: np.ndarray,
+                       wave_amps=None, wave_px_count: int = 0) -> None:
         """Upload pre-rendered buffers to GPU. Must be called from the main thread.
 
         Stores the new arrays as self._buf_* so DPG's deferred reference
         remains valid until the next frame render.
+        Also updates self._wave_amps / _wave_px_count so set_active() can
+        re-render the rest texture on subsequent track switches.
         """
         if dpg.does_item_exist(self._tag_played):
             dpg.set_value(self._tag_played, buf_played.ravel())
         if dpg.does_item_exist(self._tag_rest):
             dpg.set_value(self._tag_rest, buf_rest.ravel())
-        self._buf_played = buf_played
-        self._buf_rest   = buf_rest
+        self._buf_played    = buf_played
+        self._buf_rest      = buf_rest
+        if wave_amps is not None:
+            self._wave_amps     = wave_amps
+            self._wave_px_count = wave_px_count
 
     def _build_upload_played(self) -> None:
         """Build full waveform in active colour and upload to tag_played."""

@@ -1241,22 +1241,22 @@ class MixABTestGPU:
                             wave_peak, wave_global_peak, normalize) -> None:
         """Background: fill waveform RGB buffers, then post upload to main thread."""
         try:
-            buf_p, buf_r = tex.render_buffers(
+            buf_p, buf_r, amps, px_count = tex.render_buffers(
                 samples, track_dur, max_dur, wave_peak, wave_global_peak, normalize,
             )
-            self._post(self._on_wave_render_done, idx, path, buf_p, buf_r)
+            self._post(self._on_wave_render_done, idx, path, buf_p, buf_r, amps, px_count)
         except Exception:
             import traceback
             self._post(_log, f"_wave_render_thread EXCEPTION idx={idx}: {traceback.format_exc()}")
 
     def _on_wave_render_done(self, idx: int, path: str,
-                             buf_played, buf_rest) -> None:
+                             buf_played, buf_rest, wave_amps, wave_px_count) -> None:
         """Main thread: upload pre-rendered waveform buffers to GPU."""
         if idx >= len(self._tracks) or self._tracks[idx]["path"] != path:
             return
         tex = self._slot_textures[idx]
         if tex:
-            tex.upload_buffers(buf_played, buf_rest)
+            tex.upload_buffers(buf_played, buf_rest, wave_amps, wave_px_count)
 
     def _on_wave_done(self, idx: int, path: str, samples: tuple, peak: int) -> None:
         _log(f"_on_wave_done idx={idx} samples={len(samples)} tex={self._slot_textures[idx] is not None}")
@@ -1337,19 +1337,22 @@ class MixABTestGPU:
         if sg:
             sg.set_data(rgba)
             # set_data() appended draw_image items to slot_dl — they now sit on top
-            # of the play line that was drawn during build.  Re-create the play line
-            # at the end of slot_dl so it's always the last (topmost) item.
+            # of the play line drawn during build. Reorder to push the line last.
             dl_tag   = f"slot_dl_{idx}"
             line_tag = f"slot_play_line_{idx}"
-            if dpg.does_item_exist(dl_tag):
-                if dpg.does_item_exist(line_tag):
-                    dpg.delete_item(line_tag)
-                slot_h = self._tracks[idx].get("slot_h", 80)
-                dpg.draw_line(
-                    (0, 0), (0, slot_h),
-                    color=(255, 255, 255, 220), thickness=2,
-                    tag=line_tag, parent=dl_tag,
+            if dpg.does_item_exist(dl_tag) and dpg.does_item_exist(line_tag):
+                # Move the play line to the end of the drawlist so it renders
+                # on top of the spectrogram tiles set_data() just appended.
+                # get_item_children returns integer UUIDs — resolve the string
+                # tag to its UUID via alias lookup before comparing/reordering.
+                children = dpg.get_item_children(dl_tag, slot=2) or []
+                line_id  = next(
+                    (c for c in children if dpg.get_item_alias(c) == line_tag),
+                    None,
                 )
+                if line_id is not None and children[-1] != line_id:
+                    new_order = [c for c in children if c != line_id] + [line_id]
+                    dpg.reorder_items(dl_tag, slot=2, new_order=new_order)
         # Background: also compute the fill-window version if not yet done/pending.
         t = self._tracks[idx]
         if t.get("spectro_fs_rgba") is None and idx not in self._spectro_fs_computing:
@@ -1689,13 +1692,9 @@ class MixABTestGPU:
 
             line_tag = f"slot_play_line_{idx}"
             if play_px >= 0 and dpg.does_item_exist(line_tag):
-                if self._spectrogram_enabled and sg:
-                    if self._spectrogram_zoom == 0.0:
-                        # Full-track mode: playhead travels left→right proportionally
-                        line_x = int(frac * wave_w)
-                    else:
-                        # Scroll mode: "now" is always pinned at the right edge
-                        line_x = wave_w
+                if self._spectrogram_enabled and sg and self._spectrogram_zoom == 0.0:
+                    # Full-track mode: playhead travels left→right proportionally
+                    line_x = int(frac * wave_w)
                 else:
                     line_x = play_px
                 dpg.configure_item(line_tag, p1=(line_x, 0), p2=(line_x, slot_h))
@@ -1798,9 +1797,20 @@ class MixABTestGPU:
             return
         active = [n for n in self._processing_tasks if self._processing_tasks[n] > 0 and n]
         if active:
-            names = ", ".join(active)
+            names  = ", ".join(active)
+            text   = f"Processing ({names}), please wait.."
+            btn_h  = _CTRL_H - 12
+            vw     = self._track_area_w
+            # Pre-compute width before showing so position is correct on the first frame.
+            try:
+                lbl_w = int(dpg.get_text_size(text)[0])
+            except Exception:
+                lbl_w = 0
+            lbl_x = max(0, (vw - lbl_w) // 2)
+            lbl_y = (btn_h - 13) // 2
             dpg.configure_item(self._tag_processing_lbl,
-                               default_value=f"Processing ({names}), please wait..",
+                               default_value=text,
+                               pos=(lbl_x, lbl_y),
                                show=True)
         else:
             dpg.configure_item(self._tag_processing_lbl, show=False)

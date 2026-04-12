@@ -63,13 +63,14 @@ class SpectrumOverlay:
         self._col_to_band: np.ndarray = self._build_col_map(self._width, self._n_bands)
         self._col_to_band_n: int = self._n_bands
 
-        h = active_color.lstrip("#")
-        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        # Bars are always white so they contrast against the waveform colour on
+        # both the played (bright) and unplayed (dark) sides.  Using the track
+        # hue as the bar colour causes the bars to blend invisibly into the
+        # played waveform (same hue, ~71% alpha → no perceptual contrast).
         self._bar_color_active_f32 = np.array(
-            [r / 255.0, g / 255.0, b / 255.0, 180 / 255.0], dtype=np.float32)
+            [1.0, 1.0, 1.0, 0.75], dtype=np.float32)   # white, 75% alpha
         self._bar_color_dim_f32 = np.array(
-            [r * 0.5 / 255.0, g * 0.5 / 255.0, b * 0.5 / 255.0, 180 * 0.6 / 255.0],
-            dtype=np.float32)
+            [1.0, 1.0, 1.0, 0.30], dtype=np.float32)   # white, 30% alpha for inactive
         self._bar_color_f32 = self._bar_color_active_f32.copy()
 
         # Full-width texture: draw_image maps it 1:1, no bilinear stretching.

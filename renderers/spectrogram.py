@@ -65,12 +65,12 @@ _N_COLS_MAX        = 10000
 # ── Heat palette ─────────────────────────────────────────────────────────────
 _PALETTE_STOPS = np.array([
     [0.00,  0.00, 0.00, 0.00],
-    [0.18,  0.12, 0.00, 0.22],
-    [0.38,  0.55, 0.00, 0.65],
-    [0.55,  0.85, 0.00, 0.75],
-    [0.70,  0.95, 0.05, 0.15],
-    [0.83,  1.00, 0.35, 0.00],
-    [0.93,  1.00, 0.70, 0.00],
+    [0.10,  0.12, 0.00, 0.22],
+    [0.25,  0.55, 0.00, 0.65],
+    [0.40,  0.85, 0.00, 0.75],
+    [0.57,  0.95, 0.05, 0.15],
+    [0.72,  1.00, 0.35, 0.00],
+    [0.86,  1.00, 0.70, 0.00],
     [1.00,  1.00, 0.95, 0.40],
 ], dtype=np.float32)
 
@@ -116,12 +116,52 @@ _SHORT_WEIGHT = 0.0
 # Raise to suppress more harmonics; lower to keep more harmonic detail.
 _PRE_SCATTER_GATE = 0.05
 
+# Post-scatter per-band gate.
+# Applied after scatter-accumulate: each output row must exceed this fraction
+# of its frequency band's per-column maximum.  Set to 0.0 (disabled) because
+# the gate cannot distinguish between a weak sustained note and noise — it
+# suppresses both based purely on relative amplitude within the band.  This
+# caused systematic dropout on sub-bass sustained notes (e.g. 43 Hz) whenever
+# a louder signal existed elsewhere in the same frequency band.  The absolute
+# magnitude gate (_MAG_GATE) and pre-scatter relative gate (_PRE_SCATTER_GATE)
+# provide sufficient noise suppression without this inter-frequency competition.
+_N_BANDS          = 6
+_BAND_GATE_THRESH = 0.0   # disabled — see note above
+
+# Causal group-delay gate: maximum number of samples the energy centroid may
+# sit ahead of the window centre before the bin is rejected.  Tighter = fewer
+# precursor ghost lines on sweeps; too tight = spurious dropout on sustained
+# notes whose amplitude rises or phase-rotates within the 93 ms analysis window.
+# FFT_SIZE//4 (1024 samples = 23 ms) eliminates spurious rejections on sustained
+# notes (observed t_hat max = 595 samples) while still catching true sweep
+# precursors whose t_hat approaches FFT_SIZE//2 = 2048.
+_CAUSAL_GATE_SAMPLES = _FFT_SIZE // 4   # 1024 samples = 23 ms
+
+# Maximum half-bandwidth in display rows for the bandwidth-aware scatter.
+# Each bin scatters to rows [row_hat ± _BW_MAX_ROWS] with a triangular weight
+# profile.  The nominal log-scale bandwidth of sub-bass bins can reach ~18 rows
+# at height=300, which makes low-frequency lines appear too tall.  Capping at
+# 1.5 rows gives lines up to 3 px wide — close to the reference look while
+# still providing smooth, gap-free rendering of sustained notes.
+_BW_MAX_ROWS = 1.5
+
 # ── Log-frequency axis ────────────────────────────────────────────────────────
 _LOG_RANGE = float(np.log(_FS_FREQ_HI / _FS_FREQ_LO))   # ln(20000/20) ≈ 6.9
 
 # ── Spectral tilt ─────────────────────────────────────────────────────────────
-_TILT_DB_PER_DECADE = 4.5
+# 9.0 dB/decade boosts high-frequency content enough to match the density of
+# reference analysers on typical EDM material (which rolls off ~6-12 dB/oct).
+_TILT_DB_PER_DECADE = 9.0
 _TILT_F_REF         = 1000.0
+
+# ── Frequency-dependent gate crossover ────────────────────────────────────────
+# Both the causal gate and the pre-scatter gate are applied at full strength
+# below _GATE_F_FULL Hz and fade linearly to zero at _GATE_F_OFF Hz.
+# This keeps the low end clean (sweep-precursor rejection, harmonic suppression)
+# while allowing transient mid/high content (cymbals, hi-hats, overtones) to
+# pass through without being masked by loud bass hits.
+_GATE_F_FULL = 500.0    # Hz — gates at 100 % below this
+_GATE_F_OFF  = 4000.0   # Hz — gates fully disabled above this
 
 _cached_row_map: dict = {}
 
@@ -226,6 +266,40 @@ def compute_static(
     alpha     = 0.92
     bg_state  = None   # shape (N_BINS_S,) after first tile
 
+    # ── Bandwidth-aware scatter precomputation ────────────────────────────────
+    # Each FFT bin k nominally owns the frequency band [f_{k-0.5}, f_{k+0.5}].
+    # On a log-scale display these bands map to row ranges that grow wider as
+    # frequency decreases (up to ~18 rows at 300 px height, ~63 at 1080 px).
+    # Instead of scattering each bin to just 2 rows via bilinear interpolation,
+    # we scatter to all rows in the band with a triangular weight profile
+    # centred at the reassigned frequency.  This fills inter-bin gaps at the
+    # scatter step — no post-processing required.
+    _k_arr    = np.arange(_N_BINS, dtype=np.float32)
+    _f_lo_k   = np.maximum((_k_arr - 0.5) * (sample_rate / float(_FFT_SIZE)), _FS_FREQ_LO)
+    _f_hi_k   = np.minimum((_k_arr + 0.5) * (sample_rate / float(_FFT_SIZE)), _FS_FREQ_HI)
+    # clip before log so DC-and-below bins map cleanly to the bottom row
+    _f_lo_k   = np.clip(_f_lo_k, _FS_FREQ_LO, _FS_FREQ_HI)
+    _f_hi_k   = np.clip(_f_hi_k, _FS_FREQ_LO, _FS_FREQ_HI)
+    # row_upper = row for the HIGH-frequency edge of each bin (smaller row idx)
+    # row_lower = row for the LOW-frequency edge (larger row idx)
+    _row_upper_k = (np.log(_FS_FREQ_HI / _f_hi_k) / _LOG_RANGE * (height - 1)).astype(np.float32)
+    _row_lower_k = (np.log(_FS_FREQ_HI / _f_lo_k) / _LOG_RANGE * (height - 1)).astype(np.float32)
+    # Half-bandwidth in display rows: min 0.5 (always fill ≥1 row), max _BW_MAX_ROWS
+    _half_bw_k   = np.clip((_row_lower_k - _row_upper_k) / 2.0, 0.5, _BW_MAX_ROWS).astype(np.float32)
+
+    # Per-bin gate strength: 1.0 at f ≤ _GATE_F_FULL, 0.0 at f ≥ _GATE_F_OFF
+    _bin_freq_k        = _k_arr * (sample_rate / float(_FFT_SIZE))
+    _gate_weight_k     = np.clip(
+        (_GATE_F_OFF - _bin_freq_k) / (_GATE_F_OFF - _GATE_F_FULL), 0.0, 1.0
+    ).astype(np.float32)                                               # (N_BINS,)
+    # Causal limit per bin: _CAUSAL_GATE_SAMPLES at low freq → _FFT_SIZE (off) at high freq
+    _causal_limit_k    = (
+        _gate_weight_k * _CAUSAL_GATE_SAMPLES +
+        (1.0 - _gate_weight_k) * _FFT_SIZE
+    ).astype(np.float32)                                               # (N_BINS,)
+    # Pre-scatter threshold per bin: _PRE_SCATTER_GATE at low freq → 0.0 at high freq
+    _pre_gate_k        = (_gate_weight_k * _PRE_SCATTER_GATE).astype(np.float32)  # (N_BINS,)
+
     # ── Tile loop ─────────────────────────────────────────────────────────────
     tiles = []
 
@@ -257,43 +331,75 @@ def compute_static(
         # window — for a frequency sweep these appear as horizontal precursor lines
         # to the left of the main sweep line.  Reject them.
         t_hat_offset = (np.real(X_th / denom) - _FFT_SIZE // 2).astype(np.float32)
-        # Tight causal gate: only keep bins whose energy centroid is at or behind
-        # the window centre.  FFT_SIZE//64 ≈ 1.5 ms tolerance handles floating-
-        # point jitter on stationary sinusoids while aggressively cutting the
-        # precursor "ghost" lines caused by a rising sweep appearing in the
-        # future half of the analysis window.
-        causal       = (t_hat_offset <= _FFT_SIZE // 64).ravel()  # ≤ +64 samples
+        # Per-bin causal gate: tight at low frequencies (sweep precursor rejection),
+        # fades to disabled above _GATE_F_OFF so transient cymbal/hi-hat bins pass.
+        causal       = (t_hat_offset <= _causal_limit_k[None, :]).ravel()
 
-        # Pre-scatter relative gate: only scatter bins above _PRE_SCATTER_GATE
-        # fraction of the column's peak magnitude.  Uses raw mag (before mag**1.5),
-        # so the threshold is in linear amplitude space.
+        # Per-bin pre-scatter gate: full strength at low frequencies (keeps low end
+        # clean when loud bass hits dominate the column peak), fades to zero above
+        # _GATE_F_OFF so weak high-frequency content is never masked by the bass.
         col_peak_l = mag.max(axis=1, keepdims=True)           # (t_ncols, 1)
-        pre_gate   = (mag > col_peak_l * _PRE_SCATTER_GATE).ravel()
+        pre_gate   = (mag > col_peak_l * _pre_gate_k[None, :]).ravel()
 
         valid     = (mag > _MAG_GATE).ravel() & causal & pre_gate
 
         freq_hat  = omega_hat * (sample_rate / float(_FFT_SIZE))
         freq_hat  = np.clip(freq_hat, _FS_FREQ_LO, _FS_FREQ_HI)
         t_row     = np.log(_FS_FREQ_HI / freq_hat) / _LOG_RANGE
-        row_f     = t_row * (height - 1)
-        row_lo    = np.clip(np.floor(row_f).astype(np.int32), 0, height - 1)
-        row_hi    = np.clip(row_lo + 1,                        0, height - 1)
-        frac_hi   = (row_f - np.floor(row_f)).astype(np.float32)
+        row_f     = (t_row * (height - 1)).astype(np.float32)            # reassigned row
 
-        col_flat    = np.repeat(np.arange(t_ncols, dtype=np.int32), _N_BINS)
-        scatter_val = (mag ** 1.5).ravel()
-        w_lo        = scatter_val * (1.0 - frac_hi.ravel())
-        w_hi        = scatter_val * frac_hi.ravel()
+        # ── Bandwidth-aware scatter ───────────────────────────────────────────
+        # Each valid (col, bin) scatter point fills all display rows within its
+        # nominal frequency band with a triangular weight profile centred at the
+        # reassigned row.  This eliminates inter-bin gaps on the log scale
+        # without any post-processing pass.
+        #
+        # valid index i encodes: col = i // _N_BINS, bin = i % _N_BINS
+        valid_idx  = np.where(valid)[0]
+        size       = height * t_ncols
 
-        # bincount scatter — GIL-releasing C op, ~10-100x faster than np.add.at.
-        # Flatten the 2D (height, t_ncols) index space to 1D, accumulate, reshape.
-        size     = height * t_ncols
-        flat_lo  = (row_lo.ravel()[valid] * t_ncols + col_flat[valid]).astype(np.int64)
-        flat_hi  = (row_hi.ravel()[valid] * t_ncols + col_flat[valid]).astype(np.int64)
-        out_long = (
-            np.bincount(flat_lo, weights=w_lo[valid].astype(np.float64), minlength=size) +
-            np.bincount(flat_hi, weights=w_hi[valid].astype(np.float64), minlength=size)
-        ).reshape(height, t_ncols).astype(np.float32)
+        if len(valid_idx) == 0:
+            out_long = np.zeros((height, t_ncols), dtype=np.float32)
+        else:
+            k_v        = valid_idx % _N_BINS                             # bin index
+            col_v      = (valid_idx // _N_BINS).astype(np.int32)        # column index
+            mag_v      = ((mag ** 1.5).ravel())[valid_idx]              # scatter magnitude
+            row_hat_v  = row_f.ravel()[valid_idx]                       # reassigned centre row
+            hbw_v      = _half_bw_k[k_v]                               # half-bandwidth (rows)
+
+            # Row range to fill: centred at reassigned position, ±half_bandwidth
+            fill_lo_v  = np.clip(np.floor(row_hat_v - hbw_v).astype(np.int32), 0, height - 1)
+            fill_hi_v  = np.clip(np.ceil (row_hat_v + hbw_v).astype(np.int32), 0, height - 1)
+            n_rep_v    = np.maximum(1, fill_hi_v - fill_lo_v + 1)      # rows per scatter point
+            total_ops  = int(n_rep_v.sum())
+
+            # Expand each scatter point to n_rep_v rows (vectorised arange trick)
+            col_rep     = np.repeat(col_v,       n_rep_v)
+            mag_rep     = np.repeat(mag_v,       n_rep_v)
+            fill_lo_rep = np.repeat(fill_lo_v,   n_rep_v)
+            row_hat_rep = np.repeat(row_hat_v,   n_rep_v)
+            hbw_rep     = np.repeat(hbw_v,       n_rep_v)
+
+            # Per-row offset within each group (0, 1, 2, ..., n_rep_v[i]-1)
+            cum_n      = np.empty(len(n_rep_v) + 1, dtype=np.int64)
+            cum_n[0]   = 0
+            np.cumsum(n_rep_v.astype(np.int64), out=cum_n[1:])
+            positions  = np.arange(total_ops, dtype=np.int64)
+            grp_start  = np.repeat(cum_n[:-1], n_rep_v)
+            offsets    = (positions - grp_start).astype(np.int32)
+
+            row_rep    = np.clip(fill_lo_rep + offsets, 0, height - 1)
+
+            # Triangular weight: 1.0 at reassigned centre, 0.0 at bandwidth edge
+            dist   = np.abs(row_rep.astype(np.float32) + 0.5 - row_hat_rep)
+            weight = np.maximum(0.0, 1.0 - dist / np.maximum(hbw_rep, 0.5))
+
+            flat_rep = (row_rep.astype(np.int64) * t_ncols + col_rep.astype(np.int64))
+            out_long = np.bincount(
+                flat_rep,
+                weights=(mag_rep * weight).astype(np.float64),
+                minlength=size,
+            ).reshape(height, t_ncols).astype(np.float32)
 
         # ── Short FFT (1024, onset layer) ─────────────────────────────────────
         # Skipped entirely when disabled (_SHORT_WEIGHT == 0.0): the Python EMA
@@ -337,11 +443,7 @@ def compute_static(
 
         # ── Per-band per-column gate ───────────────────────────────────────────
         # Applied after blending, on the accumulated out_lin.  Each row must
-        # exceed this fraction of its band's column max to survive.  0.10 is
-        # loose enough to keep clean sub-bass sustained notes (which caused gaps
-        # at 0.25) while still suppressing faint noise rows in quiet bands.
-        _N_BANDS          = 6
-        _BAND_GATE_THRESH = 0.10
+        # exceed this fraction of its band's column max to survive.
         band_h = max(1, height // _N_BANDS)
         for b in range(_N_BANDS):
             r0   = b * band_h
