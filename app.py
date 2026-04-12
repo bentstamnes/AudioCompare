@@ -182,7 +182,7 @@ class MixABTestGPU:
         self._spectrum_enabled      = True
         self._spectrogram_enabled      = False
         self._spectrogram_fullscreen   = False
-        self._spectrogram_zoom         = 1.0   # time-axis zoom; 1=natural density, higher=fewer seconds visible
+        self._spectrogram_zoom         = 2.0   # time-axis zoom; 2=default, higher=fewer seconds visible
         self._fs_strip: Optional[SpectrogramStrip] = None   # fullscreen strip
         self._fft_size        = _FFT_SIZE_DEFAULT
         self._fft_bands       = _FFT_BANDS_DEFAULT
@@ -518,16 +518,10 @@ class MixABTestGPU:
                 dpg.add_text("", tag=self._tag_null_warn, show=False,
                              color=_ORANGE)
 
-                # Two half-spacers with processing label between them.
-                # Each is sized to half the full spacer width so the label stays centred.
+                # Single spacer that fills all remaining space before the right-side items.
+                # The processing label is NOT in the flow — it is absolutely positioned
+                # inside ctrl_win (added after this group) so it never shifts the right items.
                 dpg.add_spacer(tag="ctrl_spacer_l", width=1)
-                with dpg.group():
-                    dpg.add_dummy(height=(btn_h - 13) // 2)
-                    dpg.add_text("Processing, please wait..",
-                                 tag=self._tag_processing_lbl,
-                                 show=False,
-                                 color=[180, 180, 180, 200])
-                dpg.add_spacer(tag="ctrl_spacer_r", width=1)
 
                 # Mute button
                 lbl_mute = "\U0001f507" if self._muted else "\U0001f50a"
@@ -552,6 +546,15 @@ class MixABTestGPU:
                 # centered at cy=btn_h//2, so it aligns naturally with buttons.
                 dpg.add_group(tag=self._tag_dots_group, horizontal=True)
                 dpg.add_spacer(width=8)
+
+            # Processing label: absolutely positioned overlay inside ctrl_win,
+            # NOT inside the horizontal group — so it never displaces the right items.
+            # pos is updated each tick by _update_ctrl_spacer.
+            dpg.add_text("Processing, please wait..",
+                         tag=self._tag_processing_lbl,
+                         show=False,
+                         color=[180, 180, 180, 200],
+                         pos=(0, (btn_h - 13) // 2))
 
     def _build_track_area(self, track_h: int) -> None:
         """Build the track area container with an explicit pixel height."""
@@ -956,17 +959,19 @@ class MixABTestGPU:
                 label=f"{chk if self._spectrogram_fullscreen else dot}Spectrogram fill window",
                 callback=self._toggle_spectrogram_fullscreen,
             )
-            with dpg.menu(label=f"Spectrogram speed  ({'Full' if self._spectrogram_zoom == 0.0 else f'{self._spectrogram_zoom:.0f}x'})"):
+            _SPECTRO_ZOOM_LABELS = {0.0: "Full", 2.0: "1x", 4.0: "2x"}
+            _cur_zlbl = _SPECTRO_ZOOM_LABELS.get(self._spectrogram_zoom, f"{self._spectrogram_zoom:.0f}x")
+            with dpg.menu(label=f"Spectrogram speed  ({_cur_zlbl})"):
                 dpg.add_menu_item(
                     label=f"{'> ' if self._spectrogram_zoom == 0.0 else '  '}Full track",
                     callback=lambda s, a, u: self._set_spectrogram_zoom(u),
                     user_data=0.0,
                 )
-                for z in (1, 2, 4):
+                for z, lbl in ((2.0, "1x"), (4.0, "2x")):
                     dpg.add_menu_item(
-                        label=f"{'> ' if z == self._spectrogram_zoom else '  '}{z}x",
+                        label=f"{'> ' if z == self._spectrogram_zoom else '  '}{lbl}",
                         callback=lambda s, a, u: self._set_spectrogram_zoom(u),
-                        user_data=float(z),
+                        user_data=z,
                     )
             with dpg.menu(label="FFT size"):
                 for sz in (512, 1024, 2048, 4096):
@@ -1801,8 +1806,9 @@ class MixABTestGPU:
             dpg.configure_item(self._tag_processing_lbl, show=False)
 
     def _update_ctrl_spacer(self) -> None:
-        """Size the two half-spacers so right-side items hug the right edge
-        and the processing label (if visible) stays horizontally centred.
+        """Size ctrl_spacer_l so right-side items hug the right edge.
+        The processing label is absolutely positioned (not in the flow) so it
+        never affects the spacer calculation.
         """
         if not dpg.does_item_exist("ctrl_spacer_l"):
             return
@@ -1818,26 +1824,23 @@ class MixABTestGPU:
             dot_total     = n_dots * 8 + max(n_dots - 1, 0) * 8 if n_dots > 0 else 0
             btn_h         = _CTRL_H - 12
             fixed_right_w = btn_h + 6 + 140 + 16 + dot_total + 8
-            delta         = (vw - fixed_right_w) - mute_x
-
+            target_mute_x = vw - fixed_right_w
+            delta         = target_mute_x - mute_x
             cur_l = dpg.get_item_configuration("ctrl_spacer_l").get("width", 1)
-            cur_r = dpg.get_item_configuration("ctrl_spacer_r").get("width", 1)
-            total = max(8, cur_l + cur_r + delta)
+            dpg.configure_item("ctrl_spacer_l", width=max(1, cur_l + delta))
 
-            # When the label is visible, measure its rendered width and keep it centred.
-            # When hidden its width is 0 so we split the space evenly.
-            lbl_w = 0
+            # Centre the processing label using absolute pos — no layout impact.
             if (self._processing_tasks
-                    and dpg.does_item_exist(self._tag_processing_lbl)):
+                    and dpg.does_item_exist(self._tag_processing_lbl)
+                    and dpg.is_item_shown(self._tag_processing_lbl)):
                 try:
                     sz    = dpg.get_item_rect_size(self._tag_processing_lbl)
                     lbl_w = int(sz[0]) if sz else 0
+                    lbl_x = max(0, (vw - lbl_w) // 2)
+                    lbl_y = (btn_h - 13) // 2
+                    dpg.configure_item(self._tag_processing_lbl, pos=(lbl_x, lbl_y))
                 except Exception:
                     pass
-            half       = max(1, (total - lbl_w) // 2)
-            spacer_r   = max(1, total - lbl_w - half)
-            dpg.configure_item("ctrl_spacer_l", width=half)
-            dpg.configure_item("ctrl_spacer_r", width=spacer_r)
         except Exception:
             pass
 

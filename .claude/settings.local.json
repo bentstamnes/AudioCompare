@@ -75,7 +75,11 @@
       "Bash(pip install:*)",
       "Bash(python -c \"import ast; ast.parse\\(open\\('renderers/spectrogram.py', encoding='utf-8'\\).read\\(\\)\\); print\\('spectrogram.py OK'\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); print\\('app.py OK'\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('renderers/waveform.py', encoding='utf-8'\\).read\\(\\)\\); print\\('waveform.py OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('renderers/waveform.py', encoding='utf-8'\\).read\\(\\)\\); print\\('waveform.py OK'\\)\")",
+      "Bash(python -c \"import pypdf; r = pypdf.PdfReader\\('f:/Dropbox/NorthBent/MixABTestGPU/mixabtestgpu/research/dearpygui-full_reference.pdf'\\); print\\(f'Pages: {len\\(r.pages\\)}'\\)\")",
+      "Bash(python -c \"import pdfplumber; pdf = pdfplumber.open\\('f:/Dropbox/NorthBent/MixABTestGPU/mixabtestgpu/research/dearpygui-full_reference.pdf'\\); print\\(f'Pages: {len\\(pdf.pages\\)}'\\)\")",
+      "Bash(python -c \"import fitz; doc = fitz.open\\('f:/Dropbox/NorthBent/MixABTestGPU/mixabtestgpu/research/dearpygui-full_reference.pdf'\\); print\\(f'Pages: {doc.page_count}'\\)\")",
+      "Bash(python -u -c ':*)"
     ]
   }
 }
