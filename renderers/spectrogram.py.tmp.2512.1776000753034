@@ -28,21 +28,6 @@ from __future__ import annotations
 import numpy as np
 import dearpygui.dearpygui as dpg
 
-# pyfftw — if installed, use FFTW3 for batch rfft (3-5× faster than numpy for
-# the (n_cols, 4096) workload in compute_static).  The interface cache keeps
-# the FFTW plan alive across tiles and tracks so the planning cost is paid once
-# per unique array shape.  Falls back to numpy.fft transparently if not installed.
-try:
-    import pyfftw
-    import pyfftw.interfaces.numpy_fft as _fft
-    pyfftw.interfaces.cache.enable()
-    pyfftw.interfaces.cache.set_keepalive_time(60)
-    # Allow FFTW to search for the best plan (takes ~0.5 s first call per shape,
-    # but shapes are fixed after n_cols is capped, so this pays off immediately).
-    pyfftw.config.PLANNER_EFFORT = "FFTW_MEASURE"
-except ImportError:
-    import numpy.fft as _fft  # type: ignore[assignment]
-
 _SPECTRUM_DB_FLOOR = -70.0   # dBFS floor — also the colormap black point
 _FS_FREQ_LO        = 20.0    # Hz — bottom of display
 _FS_FREQ_HI        = 20000.0 # Hz — top of display
@@ -150,17 +135,12 @@ def decode_sample_rate(native_rate: int) -> int:
 def n_cols_for_samples(n_samp: int, wave_w: int) -> int:
     """Return total column count for a file with n_samp samples.
 
-    Capped at wave_w * _MAX_DISPLAY_ZOOM so we never compute more FFT frames
-    than the display can show at maximum zoom.  The UI offers zoom levels 0
-    (full-track), 1×, 2×, 4× — at zoom=4 the visible window is wave_w/4
-    texture columns wide, so wave_w*4 columns gives exactly 1 col-per-pixel
-    at the highest available zoom.  Computing beyond this threshold produces no
-    visible improvement because the GPU bilinear-filters surplus columns away.
+    With HOP_SIZE=256 every hop gets its own column up to the GPU tile limit
+    times however many tiles are needed — no artificial single-texture cap.
+    wave_w is the minimum (ensures at least one pixel per display column).
     """
-    _MAX_DISPLAY_ZOOM = 4          # highest zoom level offered in the UI
     fft_frames = max(1, n_samp // _HOP_SIZE)
-    cap        = max(wave_w, wave_w * _MAX_DISPLAY_ZOOM)
-    return min(fft_frames, cap)
+    return max(wave_w, fft_frames)
 
 
 def compute_static(
@@ -239,9 +219,9 @@ def compute_static(
         indices = starts[:, None] + np.arange(_FFT_SIZE, dtype=np.int32)[None, :]
         raw     = arr[indices]                                        # (t_ncols, FFT_SIZE)
 
-        X_h     = _fft.rfft(raw * _HANN[None, :],    axis=1)
-        X_dh    = _fft.rfft(raw * _HANN_DH[None, :], axis=1)
-        X_th    = _fft.rfft(raw * _HANN_TH[None, :], axis=1)
+        X_h     = np.fft.rfft(raw * _HANN[None, :],    axis=1)
+        X_dh    = np.fft.rfft(raw * _HANN_DH[None, :], axis=1)
+        X_th    = np.fft.rfft(raw * _HANN_TH[None, :], axis=1)
         mag     = (np.abs(X_h) / _FFT_NORM).astype(np.float32)
 
         denom     = np.where(np.abs(X_h) > 1e-10, X_h, 1e-10)
@@ -302,7 +282,7 @@ def compute_static(
             starts_s  = np.clip(tc - _FFT_SIZE_S // 2, 0, n_samp - _FFT_SIZE_S)
             idx_s     = starts_s[:, None] + np.arange(_FFT_SIZE_S, dtype=np.int32)[None, :]
             raw_s     = arr[idx_s]                                        # (t_ncols, FFT_SIZE_S)
-            X_s       = _fft.rfft(raw_s * _HANN_S[None, :], axis=1)
+            X_s       = np.fft.rfft(raw_s * _HANN_S[None, :], axis=1)
             mag_s     = (np.abs(X_s) / _FFT_NORM_S).astype(np.float32)  # (t_ncols, N_BINS_S)
 
             # Exponential moving average background — carried from previous tile
