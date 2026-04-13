@@ -107,7 +107,13 @@
       "Bash(\"f:/Dropbox/NorthBent/MixABTestGPU/.venv/Scripts/python.exe\" _test_gate.py)",
       "Bash(\"f:/Dropbox/NorthBent/MixABTestGPU/.venv/Scripts/python.exe\" _test_hifreq.py)",
       "Bash(\"f:/Dropbox/NorthBent/MixABTestGPU/.venv/Scripts/python.exe\" _test_softgate.py)",
-      "Bash(\"f:/Dropbox/NorthBent/MixABTestGPU/.venv/Scripts/python.exe\" _test_softgate_onyx.py)"
+      "Bash(\"f:/Dropbox/NorthBent/MixABTestGPU/.venv/Scripts/python.exe\" _test_softgate_onyx.py)",
+      "Bash(python _test_softgate.py)",
+      "Bash(\"/c/Users/bents/AppData/Local/Python/bin/python.exe\" -c \"import dearpygui; print\\('ok'\\)\")",
+      "Bash(\"/c/Users/bents/AppData/Local/Programs/Python/Python311/python.exe\" -c \"import dearpygui; print\\('ok'\\)\")",
+      "Bash(\"/f/Dropbox/NorthBent/MixABTestGPU/.venv/Scripts/python.exe\" _test_spectro.py)",
+      "Bash(\"/f/Dropbox/NorthBent/MixABTestGPU/.venv/Scripts/python.exe\" -)",
+      "Bash(2>&1)"
     ]
   }
 }

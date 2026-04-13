@@ -100,13 +100,13 @@ _FFT_SIZE_S  = 1024
 _N_BINS_S    = _FFT_SIZE_S // 2 + 1              # 513
 _FFT_NORM_S  = float(_FFT_SIZE_S // 4)
 _HANN_S      = np.hanning(_FFT_SIZE_S).astype(np.float32)
-# Short layer disabled: the EMA onset detection fires on any slowly-rising
-# signal (including a linear frequency sweep) because each bin sees a non-zero
-# onset for ~20 columns as the sweep approaches from below.  This produces
-# horizontal dashes to the left of the main sweep line.  The long reassigned
-# layer at HOP_SIZE=256 (5.8 ms/col) already resolves kick-drum transients
-# adequately.  Set > 0 only if future onset logic is made sweep-immune.
-_SHORT_WEIGHT = 0.0
+# Short layer blend weight.  Uses spectral flux onset (frame-difference) instead
+# of EMA background subtraction.  Flux is sweep-immune: a sweep rising through a
+# 43 Hz bin over ~4 frames produces a per-frame delta of ~0.25× peak — well below
+# the rel_gate threshold of 0.40.  A genuine transient (cymbal, hi-hat, snare
+# crack) produces a delta of ~1.0× in a single frame.  Tune upward to add more
+# transient brightness; downward if short-layer noise becomes audible.
+_SHORT_WEIGHT = 1.0
 
 # Pre-scatter per-column relative gate (long layer only).
 # Each bin must exceed this fraction of the column's peak magnitude to be
@@ -260,11 +260,8 @@ def compute_static(
     # phase jitter on sustained bass still produces onset diffs above gate.
     freq_ok   = (k_s_all * (sample_rate / float(_FFT_SIZE_S))) >= 300.0  # (N_BINS_S,)
 
-    # EMA alpha for background subtraction; carried across tiles.
-    # 0.92 tracks the background more tightly than 0.80 — lag is ~1-2 cols
-    # instead of ~5, eliminating horizontal streaks from slow-rising sweeps.
-    alpha     = 0.92
-    bg_state  = None   # shape (N_BINS_S,) after first tile
+    # Previous-frame spectrum for spectral flux onset; carried across tiles.
+    prev_frame_s = None   # shape (N_BINS_S,) after first column
 
     # ── Bandwidth-aware scatter precomputation ────────────────────────────────
     # Each FFT bin k nominally owns the frequency band [f_{k-0.5}, f_{k+0.5}].
@@ -402,8 +399,7 @@ def compute_static(
             ).reshape(height, t_ncols).astype(np.float32)
 
         # ── Short FFT (1024, onset layer) ─────────────────────────────────────
-        # Skipped entirely when disabled (_SHORT_WEIGHT == 0.0): the Python EMA
-        # loop runs t_ncols (~10k) iterations holding the GIL for no benefit.
+        # Skipped entirely when disabled (_SHORT_WEIGHT == 0.0).
         if _SHORT_WEIGHT > 0.0:
             starts_s  = np.clip(tc - _FFT_SIZE_S // 2, 0, n_samp - _FFT_SIZE_S)
             idx_s     = starts_s[:, None] + np.arange(_FFT_SIZE_S, dtype=np.int32)[None, :]
@@ -411,20 +407,18 @@ def compute_static(
             X_s       = _fft.rfft(raw_s * _HANN_S[None, :], axis=1)
             mag_s     = (np.abs(X_s) / _FFT_NORM_S).astype(np.float32)  # (t_ncols, N_BINS_S)
 
-            # Exponential moving average background — carried from previous tile
-            bg_s = np.empty_like(mag_s)
-            if bg_state is None:
-                bg_s[0] = mag_s[0]
-            else:
-                bg_s[0] = alpha * bg_state + (1.0 - alpha) * mag_s[0]
-            for i in range(1, t_ncols):
-                bg_s[i] = alpha * bg_s[i - 1] + (1.0 - alpha) * mag_s[i]
-            bg_state = bg_s[-1].copy()
-
-            mag_s_onset  = np.maximum(mag_s - bg_s, 0.0)
+            # Spectral flux onset: onset[t] = max(mag[t] - mag[t-1], 0).
+            # Sweep-immune: a sweep crossing a 43 Hz bin over ~4 frames produces
+            # a per-frame delta of ~0.25× peak (below the rel_gate of 0.40).
+            # A genuine transient rises from near-zero in one frame → delta ≈ 1.0×.
+            # Fully vectorised — no Python loop, no GIL hold.
+            prev        = prev_frame_s if prev_frame_s is not None else np.zeros(_N_BINS_S, dtype=np.float32)
+            stacked     = np.vstack([prev[None, :], mag_s])              # (t_ncols+1, N_BINS_S)
+            mag_s_onset = np.maximum(stacked[1:] - stacked[:-1], 0.0).astype(np.float32)
+            prev_frame_s = mag_s[-1].copy()
 
             freq_ok_full = np.tile(freq_ok, t_ncols)
-            rel_gate     = mag_s_onset > 0.15 * mag_s
+            rel_gate     = mag_s_onset > 0.40 * mag_s
             valid_s      = (mag_s_onset > _MAG_GATE).ravel() & freq_ok_full & rel_gate.ravel()
 
             col_flat_s   = np.repeat(np.arange(t_ncols, dtype=np.int32), _N_BINS_S)
