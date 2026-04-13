@@ -329,12 +329,21 @@ def run_null_test(path_ref: str, path_cand: str,
     ref_mono  = ref_a.mean(axis=1)  if ref_a.ndim  > 1 else ref_a.copy()
     cand_mono = cand_a.mean(axis=1) if cand_a.ndim > 1 else cand_a.copy()
     frac_delay = _phase_slope_delay(ref_mono, cand_mono)
-    if abs(frac_delay) >= 0.01:
+    # The phase-slope estimator is only reliable when the integer alignment
+    # has already been applied and the residual delay is truly sub-sample.
+    # For signals with significant processing differences the weighted
+    # regression can return delays of many samples; feeding those to the
+    # sinc FIR collapses h.sum() to near-zero, causing h /= h.sum() to
+    # produce coefficients of ~1e7 and astronomical null amplitudes.
+    # Cap to ±1 sample — anything larger indicates an unreliable estimate.
+    if 0.01 <= abs(frac_delay) < 1.0:
         cand_a = _apply_fractional_delay(cand_a, frac_delay)
         # fftconvolve with mode='same' can shift length by 1 — re-trim
         n = min(len(ref_a), len(cand_a))
         ref_a  = ref_a[:n]
         cand_a = cand_a[:n]
+    else:
+        frac_delay = 0.0   # unreliable — record as zero in metrics
 
     # ── 8. Null ───────────────────────────────────────────────────────────────
     _prog("Computing null…")
@@ -350,6 +359,43 @@ def run_null_test(path_ref: str, path_cand: str,
     del ref, cand, ref_a, cand_a, null_f64
 
     return metrics, null_f32
+
+
+def prepare_for_engine(null_f32: np.ndarray, src_sr: int,
+                        target_sr: int = 48000) -> np.ndarray:
+    """Resample *null_f32* to *target_sr* and ensure stereo, ready for AudioEngine.set_buffer().
+
+    AudioEngine always plays at 48000 Hz stereo.  The null is computed at the
+    file's native sample rate which may differ — passing a mismatched array
+    causes the engine position to overshoot the buffer end immediately, producing
+    silence.
+    """
+    _ensure_scipy()
+    from scipy.signal import resample_poly
+    from math import gcd
+
+    arr = np.asarray(null_f32, dtype=np.float32)
+
+    # ── Resample to engine sample rate ────────────────────────────────────────
+    if src_sr != target_sr:
+        g    = gcd(src_sr, target_sr)
+        up   = target_sr // g
+        down = src_sr    // g
+        if arr.ndim == 1:
+            arr = resample_poly(arr, up, down).astype(np.float32)
+        else:
+            arr = np.column_stack([
+                resample_poly(arr[:, ch], up, down).astype(np.float32)
+                for ch in range(arr.shape[1])
+            ])
+
+    # ── Ensure stereo (engine expects shape (n, 2)) ───────────────────────────
+    if arr.ndim == 1:
+        arr = np.column_stack([arr, arr])
+    elif arr.shape[1] == 1:
+        arr = np.column_stack([arr[:, 0], arr[:, 0]])
+
+    return arr
 
 
 def downsample_for_waveform(null_f32: np.ndarray, sr: int,

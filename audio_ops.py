@@ -181,11 +181,12 @@ def probe_duration(path):
 
 
 def probe_info(path: str) -> dict:
-    """Return {duration, sample_rate, channels, codec_name} for an audio file.
+    """Return {duration, sample_rate, channels, codec_name, bits_per_sample} for an audio file.
 
     Falls back to safe defaults on any failure so callers never need to guard
     against None.  codec_name is the raw ffprobe codec name (e.g. "mp3", "aac",
-    "flac", "pcm_s24le") or "" on failure.
+    "flac", "pcm_s24le") or "" on failure.  bits_per_sample is 0 for lossy
+    formats where the concept doesn't apply.
     """
     try:
         cmd = [
@@ -202,17 +203,24 @@ def probe_info(path: str) -> dict:
         sample_rate = 48000
         channels    = 2
         codec_name  = ""
+        bits_per_sample = 0
         for stream in data.get("streams", []):
             if stream.get("codec_type") == "audio":
                 sample_rate = int(stream.get("sample_rate", 48000))
                 channels    = int(stream.get("channels", 2))
                 codec_name  = stream.get("codec_name", "")
+                # bits_per_raw_sample is set for lossless PCM/FLAC; bits_per_sample
+                # for some containers.  Either may be absent or 0 for lossy formats.
+                bits_per_sample = int(stream.get("bits_per_raw_sample", 0) or
+                                      stream.get("bits_per_sample", 0))
                 break
         return {
             "duration": duration,
             "sample_rate": sample_rate,
             "channels": channels,
             "codec_name": codec_name,
+            "bits_per_sample": bits_per_sample,
         }
     except Exception:
-        return {"duration": 0.0, "sample_rate": 48000, "channels": 2, "codec_name": ""}
+        return {"duration": 0.0, "sample_rate": 48000, "channels": 2,
+                "codec_name": "", "bits_per_sample": 0}

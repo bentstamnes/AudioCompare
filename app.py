@@ -678,7 +678,7 @@ class MixABTestGPU:
             dpg.add_child_window(tag=tag, width=-1, height=h,
                                  no_scrollbar=True, border=False, parent=parent)
             dpg.bind_item_theme(tag, self._slot_theme)
-            self._build_null_slot_content(tag, vw, h)
+            self._build_null_slot_content(tag, max(1, vw - METER_W), h)
             return
 
         if idx >= len(self._tracks):
@@ -801,8 +801,17 @@ class MixABTestGPU:
         name = os.path.basename(track["path"])
         if self._null_mode and idx < 3:
             name = f"{('[REF]', '[A]', '[B]')[idx]} {name}"
+        sr   = track.get("sample_rate", 0)
+        bps  = track.get("bits_per_sample", 0)
+        codec = track.get("codec_name", "")
+        if bps:
+            fmt_line = f"{sr} Hz / {bps}-bit"
+        elif codec:
+            fmt_line = f"{sr} Hz / {codec.upper()}"
+        else:
+            fmt_line = f"{sr} Hz"
         name_tag = f"slot_name_{idx}"
-        dpg.add_text(name, pos=(8, 4),
+        dpg.add_text(f"{name}\n{fmt_line}", pos=(8, 4),
                      color=list(_BTN_FG if idx == self._active else _DIM_FG),
                      tag=name_tag, parent=tag)
         if self._font_bold:
@@ -1090,19 +1099,21 @@ class MixABTestGPU:
         dur  = info["duration"]
 
         track = {
-            "id":           track_id,
-            "path":         path,
-            "duration":     dur,
-            "codec_name":   info.get("codec_name", ""),
-            "slot":         slot,
-            "audio_ready":  False,
-            "audio_peak":   0.0,
-            "wave_raw":     None,
-            "wave_peak":    1,
-            "wave_loading": False,
-            "peak_hold":      0.0,
-            "peak_hold_time": 0.0,
-            "_flash_factor":  0.0,
+            "id":              track_id,
+            "path":            path,
+            "duration":        dur,
+            "codec_name":      info.get("codec_name", ""),
+            "sample_rate":     info.get("sample_rate", 48000),
+            "bits_per_sample": info.get("bits_per_sample", 0),
+            "slot":            slot,
+            "audio_ready":     False,
+            "audio_peak":      0.0,
+            "wave_raw":        None,
+            "wave_peak":       1,
+            "wave_loading":    False,
+            "peak_hold":       0.0,
+            "peak_hold_time":  0.0,
+            "_flash_factor":   0.0,
         }
         self._tracks.append(track)
         old_max = self._max_dur
@@ -1704,10 +1715,10 @@ class MixABTestGPU:
             slot_tag = "slot_win_3"
             if dpg.does_item_exist(slot_tag):
                 sz     = dpg.get_item_rect_size(slot_tag)
-                null_w = max(1, int(sz[0]))
+                null_w = max(1, int(sz[0]) - METER_W)
                 null_h = max(1, int(sz[1]))
             else:
-                null_w = self._track_area_w
+                null_w = max(1, self._track_area_w - METER_W)
                 null_h = max(1, (self._track_area_h - _TRACK_PAD * (MAX_TRACKS - 1)) // MAX_TRACKS)
             play_px    = int(null_w * frac)
             split_frac = play_px / null_w if null_w > 0 else 0.0
@@ -1978,9 +1989,14 @@ class MixABTestGPU:
         self._null_running = False
         dpg.configure_item(self._tag_null_toggle, enabled=True)
         self._null_results[cand_idx] = metrics
-        self._null_arrays[cand_idx]  = null_f32
-        self._null_selected          = cand_idx
         sr = metrics.get("sample_rate", 48000)
+        # Resample to engine rate (48 kHz) and ensure stereo before storing.
+        # The null is computed at the file's native SR; passing a mismatched
+        # array to set_buffer causes the engine position to overshoot immediately
+        # → silence.
+        null_engine = null_ops.prepare_for_engine(null_f32, src_sr=sr)
+        self._null_arrays[cand_idx]  = null_engine
+        self._null_selected          = cand_idx
         self._null_wave_raw = null_ops.downsample_for_waveform(null_f32, sr)
         self._null_wave_sr  = sr
         self._refresh_null_waveform()
@@ -2192,7 +2208,8 @@ class MixABTestGPU:
     def _on_null_slot_click(self) -> None:
         mx, _ = dpg.get_mouse_pos(local=True)
         if self._max_dur > 0:
-            frac = max(0.0, min(1.0, mx / max(1, self._track_area_w)))
+            wave_w = max(1, self._track_area_w - METER_W)
+            frac = max(0.0, min(1.0, mx / wave_w))
             self._seek_to(frac * self._max_dur)
 
     # ── Dots ──────────────────────────────────────────────────────────────────

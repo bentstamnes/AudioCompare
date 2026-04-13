@@ -36,20 +36,9 @@ jobs:
           path: MixABTestGPU-windows.zip
           retention-days: 30
 
-  # ── macOS (shared steps via strategy matrix) ──────────────────────────────
+  # ── macOS (Apple Silicon / arm64) ─────────────────────────────────────────
   build-macos:
-    strategy:
-      matrix:
-        include:
-          - runner: macos-latest   # arm64 / Apple Silicon
-            arch: arm64
-            artifact: MixABTestGPU-macos-arm64
-          - runner: macos-13       # x86_64 / Intel
-            arch: x86_64
-            artifact: MixABTestGPU-macos-intel
-
-    runs-on: ${{ matrix.runner }}
-
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -63,9 +52,8 @@ jobs:
       - name: Install Python dependencies
         run: pip install dearpygui numpy scipy sounddevice Pillow pyfftw pyinstaller
 
-      - name: Download static ffmpeg (${{ matrix.arch }})
+      - name: Download static ffmpeg for macOS arm64
         # evermeet.cx provides self-contained static macOS builds (no dylib deps).
-        # The site serves the correct architecture for the requesting machine.
         run: |
           curl -fsSL "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip" -o ffmpeg.zip
           unzip -o ffmpeg.zip
@@ -77,10 +65,10 @@ jobs:
         run: pyinstaller build.spec
 
       - name: Package .app bundle
-        run: ditto -c -k --keepParent "dist/MixABTestGPU.app" ${{ matrix.artifact }}.zip
+        run: ditto -c -k --keepParent "dist/MixABTestGPU.app" MixABTestGPU-macos-arm64.zip
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}.zip
+          name: MixABTestGPU-macos-arm64
+          path: MixABTestGPU-macos-arm64.zip
           retention-days: 30
