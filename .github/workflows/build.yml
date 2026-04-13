@@ -1,0 +1,71 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+
+  # ── Windows ────────────────────────────────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: pip install dearpygui numpy scipy sounddevice Pillow pyfftw pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller build.spec
+
+      - name: Package
+        shell: pwsh
+        run: Compress-Archive -Path dist\MixABTestGPU -DestinationPath MixABTestGPU-windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MixABTestGPU-windows
+          path: MixABTestGPU-windows.zip
+          retention-days: 30
+
+  # ── macOS (Apple Silicon) ──────────────────────────────────────────────────
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install FFTW (required by pyfftw)
+        run: brew install fftw
+
+      - name: Install Python dependencies
+        run: pip install dearpygui numpy scipy sounddevice Pillow pyfftw pyinstaller
+
+      - name: Download static ffmpeg for macOS arm64
+        # evermeet.cx provides self-contained static builds — no dylib dependencies.
+        run: |
+          curl -fsSL "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip" -o ffmpeg.zip
+          unzip -o ffmpeg.zip
+          curl -fsSL "https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip" -o ffprobe.zip
+          unzip -o ffprobe.zip
+          chmod +x ffmpeg ffprobe
+
+      - name: Build with PyInstaller
+        run: pyinstaller build.spec
+
+      - name: Package .app bundle
+        run: ditto -c -k --keepParent "dist/MixABTestGPU.app" MixABTestGPU-macos.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MixABTestGPU-macos
+          path: MixABTestGPU-macos.zip
+          retention-days: 30
